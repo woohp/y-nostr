@@ -1,0 +1,44 @@
+{
+    "name": "y-nostr",
+    "version": "0.1.0",
+    "description": "Yjs provider using Nostr relay signaling and WebRTC data channels",
+    "license": "ISC",
+    "author": "",
+    "files": [
+        "dist",
+        "README.md"
+    ],
+    "type": "module",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.js"
+        }
+    },
+    "scripts": {
+        "build": "rm -rf dist && tsgo -p tsconfig.json",
+        "prepare": "npm run build",
+        "dev": "vite examples/browser-smoke --host 0.0.0.0",
+        "format": "oxfmt --write .",
+        "lint": "oxlint .",
+        "typecheck": "tsgo -p tsconfig.json --noEmit",
+        "check": "npm run lint && npm run typecheck && npm test",
+        "test": "npm run build && node --test"
+    },
+    "dependencies": {
+        "@noble/secp256k1": "^3.1.0",
+        "lib0": "^0.2.114",
+        "webrtc-data-peer": "git+https://github.com/woohp/webrtc-data-peer.git#4ae1949",
+        "y-protocols": "^1.0.6",
+        "yjs": "^13.6.27"
+    },
+    "devDependencies": {
+        "@typescript/native-preview": "^7.0.0-dev.20260525.1",
+        "oxfmt": "^0.52.0",
+        "oxlint": "^1.67.0",
+        "typescript": "^6.0.3",
+        "vite": "^6.3.5"
+    }
+}

@@ -1,0 +1,444 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import * as Y from "yjs";
+
+class FakeDataChannel {
+    binaryType = "blob";
+    readyState = "connecting";
+    listeners = new Map();
+
+    addEventListener(event, listener) {
+        this.listeners.set(event, listener);
+    }
+
+    send() {}
+    close() {}
+
+    markOpen() {
+        this.readyState = "open";
+    }
+
+    dispatchOpen() {
+        assert.equal(this.readyState, "open");
+        this.listeners.get("open")?.();
+    }
+
+    receive(data) {
+        this.listeners.get("message")?.({ data });
+    }
+}
+
+class FakePeerConnection {
+    connectionState = "connected";
+    iceConnectionState = "connected";
+    iceGatheringState = "complete";
+    localDescription = null;
+    remoteDescription = null;
+    channel = new FakeDataChannel();
+
+    addEventListener() {}
+    createDataChannel() {
+        return this.channel;
+    }
+    async createOffer() {
+        return { type: "offer", sdp: "fake-offer" };
+    }
+    async createAnswer() {
+        return { type: "answer", sdp: "fake-answer" };
+    }
+    async setLocalDescription(description) {
+        this.localDescription = { ...description, toJSON: () => ({ ...description }) };
+    }
+    async setRemoteDescription(description) {
+        this.remoteDescription = description;
+    }
+    close() {}
+}
+
+class SelectiveWebSocket {
+    static OPEN = 1;
+    readyState = 0;
+
+    constructor(url) {
+        if (url.includes("invalid")) throw new Error("Invalid relay URL");
+    }
+
+    addEventListener() {}
+    send() {}
+    close() {}
+}
+
+globalThis.RTCPeerConnection = FakePeerConnection;
+
+const { NostrProvider, createEvent, createIdentity, defaultRtcConfig } =
+    await import("../dist/index.js");
+
+const privateKey = (value) => {
+    const key = new Uint8Array(32);
+    key[31] = value;
+    return key;
+};
+
+function createProvider(keyValue) {
+    return new NostrProvider("test-room", new Y.Doc(), {
+        privateKey: privateKey(keyValue),
+        relays: [],
+    });
+}
+
+test("uses public STUN servers by default and allows rtcConfig overrides", async () => {
+    const provider = createProvider(1);
+    await provider.ready;
+    assert.equal(provider.rtcConfig, defaultRtcConfig);
+    assert.deepEqual(provider.rtcConfig.iceServers, [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun.cloudflare.com:3478" },
+    ]);
+
+    const rtcConfig = { iceServers: [] };
+    const overridden = new NostrProvider("test-room", new Y.Doc(), {
+        privateKey: privateKey(2),
+        relays: [],
+        rtcConfig,
+    });
+    await overridden.ready;
+    assert.equal(overridden.rtcConfig, rtcConfig);
+
+    provider.destroy();
+    overridden.destroy();
+});
+
+test("sendToPeer sends a directed binary message to only the selected peer", async () => {
+    const sender = createProvider(3);
+    await sender.ready;
+    const sent = [];
+    sender.peers.set("recipient", {
+        connected: true,
+        send: (data) => {
+            sent.push(data);
+            return true;
+        },
+        destroy: () => {},
+    });
+    sender.peers.set("other", {
+        connected: true,
+        send: () => {
+            assert.fail("message was sent to an unintended peer");
+        },
+        destroy: () => {},
+    });
+
+    assert.equal(sender.sendToPeer("recipient", new Uint8Array([1, 2, 3])), true);
+    assert.equal(sent.length, 1);
+
+    const recipient = createProvider(4);
+    await recipient.ready;
+    const peer = recipient.createPeer(sender.peerId, true);
+    const received = new Promise((resolve) => {
+        recipient.on("direct-message", (peerId, payload) => resolve({ peerId, payload }));
+    });
+    peer.channel.receive(sent[0].buffer);
+
+    assert.deepEqual(await received, {
+        peerId: sender.peerId,
+        payload: new Uint8Array([1, 2, 3]),
+    });
+
+    sender.destroy();
+    recipient.destroy();
+});
+
+test("only the deterministically selected peer creates an offer", async () => {
+    const first = createProvider(6);
+    const second = createProvider(7);
+    await Promise.all([first.ready, second.ready]);
+    const [lower, higher] = [first, second].sort((a, b) => a.peerId.localeCompare(b.peerId));
+
+    const relay = { url: "wss://relay.test", publish: () => {} };
+    await lower.receiveAnnounce(higher.peerId, relay);
+    await higher.receiveAnnounce(lower.peerId, relay);
+
+    assert.equal(lower.pendingPeers.get(higher.peerId)?.role, "offering");
+    assert.equal(higher.pendingPeers.has(lower.peerId), false);
+
+    first.destroy();
+    second.destroy();
+});
+
+test("completes event-driven encrypted offer and answer signaling", async () => {
+    const first = createProvider(8);
+    const second = createProvider(9);
+    await Promise.all([first.ready, second.ready]);
+    const [lower, higher] = [first, second].sort((a, b) => a.peerId.localeCompare(b.peerId));
+    const participants = [lower, higher];
+    const relay = {
+        url: "wss://relay.test",
+        publish: (event) => {
+            for (const provider of participants) {
+                queueMicrotask(() => void provider.receiveEvent(event, relay));
+            }
+        },
+    };
+
+    await lower.announce(relay);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    assert.equal(lower.pendingPeers.get(higher.peerId)?.role, "offering");
+    assert.equal(higher.pendingPeers.get(lower.peerId)?.role, "answering");
+    assert.equal(lower.pendingPeers.get(higher.peerId)?.peer.pc.remoteDescription.type, "answer");
+    assert.equal(higher.pendingPeers.get(lower.peerId)?.peer.pc.remoteDescription.type, "offer");
+
+    first.destroy();
+    second.destroy();
+});
+
+test("sendToPeer returns false for missing and disconnected peers", async () => {
+    const provider = createProvider(5);
+    await provider.ready;
+    provider.peers.set("disconnected", {
+        connected: false,
+        send: () => {},
+        destroy: () => {},
+    });
+
+    assert.equal(provider.sendToPeer("missing", new Uint8Array()), false);
+    assert.equal(provider.sendToPeer("disconnected", new Uint8Array()), false);
+
+    provider.destroy();
+});
+test("keeps valid relays when another relay constructor throws", async () => {
+    const provider = new NostrProvider("test-room", new Y.Doc(), {
+        privateKey: privateKey(17),
+        relays: ["invalid://relay", "wss://valid.test"],
+        WebSocket: SelectiveWebSocket,
+    });
+    const error = new Promise((resolve) => provider.on("connection-error", resolve));
+
+    await provider.ready;
+
+    assert.match(String((await error).error), /Invalid relay URL/);
+    assert.equal(provider.relayConnections.length, 1);
+    assert.equal(provider.relayConnections[0].url, "wss://valid.test");
+    provider.destroy();
+});
+
+test("rejects signaling ciphertext re-signed by another identity or moved to another topic", async () => {
+    const sender = createProvider(10);
+    const receiver = createProvider(11);
+    await Promise.all([sender.ready, receiver.ready]);
+    const relay = { url: "wss://relay.test", publish: () => {} };
+    let announcements = 0;
+    receiver.receiveAnnounce = async () => {
+        announcements++;
+    };
+
+    const original = await sender.createPayloadEvent(sender.roomTopic, {
+        v: 2,
+        type: "announce",
+    });
+    await receiver.receiveEvent(original, relay);
+    assert.equal(announcements, 1);
+
+    const attacker = createIdentity(privateKey(12));
+    const resigned = await createEvent(receiver.roomTopic, original.content, attacker);
+    await receiver.receiveEvent(resigned, relay);
+    const moved = await createEvent("different-topic", original.content, sender.identity);
+    await receiver.receiveEvent(moved, relay);
+    const misrouted = await sender.createPayloadEvent(sender.roomTopic, {
+        v: 2,
+        type: "announce-response",
+        to: receiver.peerId,
+    });
+    await receiver.receiveEvent(misrouted, relay);
+    assert.equal(announcements, 1);
+
+    sender.destroy();
+    receiver.destroy();
+});
+
+test("reports malformed peer frames and destroys the peer", async () => {
+    const provider = createProvider(13);
+    await provider.ready;
+    const peer = provider.createPeer("remote", true);
+    const error = new Promise((resolve) => provider.on("peer-error", resolve));
+
+    provider.onPeerMessage(peer, "remote", new ArrayBuffer(0));
+
+    assert.ok((await error) instanceof Error);
+    assert.equal(peer.closed, true);
+    provider.destroy();
+});
+
+test("sets synced only after Sync Step 2 and synchronizes documents", async () => {
+    const first = createProvider(14);
+    const second = createProvider(15);
+    await Promise.all([first.ready, second.ready]);
+    first.doc.getText("text").insert(0, "hello");
+
+    const firstPeer = first.createPeer(second.peerId, true);
+    const secondPeer = second.createPeer(first.peerId, true);
+    firstPeer.channel.send = (data) => secondPeer.channel.receive(data.slice().buffer);
+    secondPeer.channel.send = (data) => firstPeer.channel.receive(data.slice().buffer);
+
+    assert.equal(first.synced, false);
+    assert.equal(second.synced, false);
+    firstPeer.channel.markOpen();
+    secondPeer.channel.markOpen();
+    firstPeer.channel.dispatchOpen();
+    assert.equal(first.synced, true);
+    assert.equal(second.synced, false);
+    secondPeer.channel.dispatchOpen();
+    assert.equal(second.synced, true);
+    assert.equal(second.doc.getText("text").toString(), "hello");
+
+    firstPeer.destroy();
+    assert.equal(first.synced, false);
+    first.destroy();
+    second.destroy();
+});
+
+test("connect shares initialization and is reusable while destroy is final", async () => {
+    const provider = createProvider(16);
+    assert.equal(provider.connect(), provider.ready);
+    await provider.ready;
+    provider.disconnect();
+    assert.equal(provider.shouldConnect, false);
+
+    await provider.connect();
+    assert.equal(provider.shouldConnect, true);
+    provider.destroy();
+    await provider.connect();
+    assert.equal(provider.shouldConnect, false);
+});
+test("connect can retry after key derivation fails", async (context) => {
+    const originalCrypto = globalThis.crypto;
+    context.after(() => {
+        Object.defineProperty(globalThis, "crypto", {
+            configurable: true,
+            value: originalCrypto,
+        });
+    });
+    let rejectImport = true;
+    const subtle = new Proxy(originalCrypto.subtle, {
+        get(target, property) {
+            if (property === "importKey" && rejectImport) {
+                return () => {
+                    rejectImport = false;
+                    return Promise.reject(new Error("KDF failed"));
+                };
+            }
+            const value = Reflect.get(target, property);
+            return typeof value === "function" ? value.bind(target) : value;
+        },
+    });
+    Object.defineProperty(globalThis, "crypto", {
+        configurable: true,
+        value: {
+            subtle,
+            getRandomValues: originalCrypto.getRandomValues.bind(originalCrypto),
+        },
+    });
+
+    const provider = createProvider(18);
+    await assert.rejects(provider.ready, /KDF failed/);
+    Object.defineProperty(globalThis, "crypto", { configurable: true, value: originalCrypto });
+
+    await provider.connect();
+    assert.equal(provider.shouldConnect, true);
+    provider.destroy();
+});
+
+test("announcement recovery is bounded, non-overlapping, and cancellable", async (context) => {
+    const provider = createProvider(19);
+    await provider.ready;
+    context.mock.method(Math, "random", () => 0);
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    let announcements = 0;
+    provider.announce = async () => {
+        announcements++;
+    };
+
+    provider.scheduleAnnouncementRetry();
+    provider.scheduleAnnouncementRetry();
+    for (const delay of [375, 750, 1500]) {
+        context.mock.timers.tick(delay);
+        await Promise.resolve();
+        await Promise.resolve();
+    }
+    assert.equal(announcements, 3);
+    assert.equal(provider.announcementRetry.attempt, 3);
+
+    provider.scheduleAnnouncementRetry();
+    await provider.receiveAnnounce("f".repeat(64), {
+        url: "wss://relay.test",
+        publish: () => {},
+    });
+    context.mock.timers.tick(375);
+    assert.equal(announcements, 3);
+    assert.equal(provider.announcementRetry, null);
+
+    provider.pendingPeers.clear();
+    provider.destroy();
+});
+test("recovery resumes when a pending peer disappears during offer creation", async (context) => {
+    const provider = createProvider(21);
+    context.after(() => provider.destroy());
+    await provider.ready;
+    context.mock.method(Math, "random", () => 0);
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    let resolveOffer;
+    const offer = new Promise((resolve) => {
+        resolveOffer = resolve;
+    });
+    provider.createPeer = () => ({
+        createOffer: () => offer,
+        destroy: () => {},
+    });
+    provider.scheduleAnnouncementRetry();
+
+    const peerId = "f".repeat(64);
+    const receiving = provider.receiveAnnounce(peerId, {
+        url: "wss://relay.test",
+        publish: () => {},
+    });
+    await Promise.resolve();
+    assert.equal(provider.announcementRetry.paused, true);
+    provider.pendingPeers.delete(peerId);
+    resolveOffer({ type: "offer", sdp: "late offer" });
+    await receiving;
+
+    assert.equal(provider.announcementRetry.paused, false);
+    assert.ok(provider.announcementRetry.timer);
+});
+
+test("repeated offer failures preserve the global retry budget", async (context) => {
+    const provider = createProvider(20);
+    context.after(() => provider.destroy());
+    await provider.ready;
+    context.mock.method(Math, "random", () => 0);
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    let announcements = 0;
+    provider.announce = async () => {
+        announcements++;
+    };
+    provider.createPeer = (peerId) => ({
+        createOffer: async () => {
+            throw new Error("offer failed");
+        },
+        destroy: () => provider.pendingPeers.delete(peerId),
+    });
+    const relay = { url: "wss://relay.test", publish: () => {} };
+
+    provider.scheduleAnnouncementRetry();
+    for (const delay of [375, 750, 1500]) {
+        context.mock.timers.tick(delay);
+        await Promise.resolve();
+        await Promise.resolve();
+        await provider.receiveAnnounce("f".repeat(64), relay);
+    }
+    context.mock.timers.tick(10000);
+
+    assert.equal(announcements, 3);
+    assert.equal(provider.announcementRetry.attempt, 3);
+    provider.destroy();
+});
