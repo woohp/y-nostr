@@ -5,6 +5,7 @@ const textDecoder = new TextDecoder();
 
 export const nostrEventKind = 20000;
 export const nostrTopicTag = "x";
+export const signalExpirationSeconds = 120;
 
 export interface NostrEvent {
     id: string;
@@ -141,7 +142,7 @@ export const createEvent = async (
         kind: nostrEventKind,
         tags: [
             [nostrTopicTag, topic],
-            ["expiration", String(createdAt + 120)],
+            ["expiration", String(createdAt + signalExpirationSeconds)],
         ],
         content,
     };

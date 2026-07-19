@@ -12,6 +12,7 @@ import {
     decrypt,
     deriveRoomSecrets,
     encrypt,
+    signalExpirationSeconds,
     type NostrEvent,
     type NostrIdentity,
 } from "./crypto.js";
@@ -263,7 +264,13 @@ export class NostrProvider extends Observable<string> {
             try {
                 const relay = new NostrRelay(url, {
                     topics: [roomTopic, peerTopic],
-                    onEvent: (event, relay) => void this.receiveEvent(event, relay, generation),
+                    onEvent: (event, relay) => {
+                        void this.receiveEvent(event, relay, generation).catch((error: unknown) => {
+                            if (this.isCurrentGeneration(generation)) {
+                                this.emit("connection-error", [{ error, relay: relay.url }]);
+                            }
+                        });
+                    },
                     onOpen: (relay, reconnected) => {
                         if (!this.isCurrentGeneration(generation)) return;
                         const publication = reconnected
@@ -276,9 +283,13 @@ export class NostrProvider extends Observable<string> {
                                   return relay.publish(event);
                               });
                         void publication
-                            .then((published) => {
+                            .catch((error: unknown) => {
+                                if (reconnected) {
+                                    this.emit("connection-error", [{ error, relay: relay.url }]);
+                                }
+                            })
+                            .finally(() => {
                                 if (
-                                    published &&
                                     this.recoveryStartPending &&
                                     this.openRelays.size > 0 &&
                                     this.isCurrentGeneration(generation)
@@ -286,10 +297,7 @@ export class NostrProvider extends Observable<string> {
                                     this.recoveryStartPending = false;
                                     this.startAnnouncementRecoveryEpisode();
                                 }
-                            })
-                            .catch((error: unknown) =>
-                                this.emit("connection-error", [{ error, relay: relay.url }]),
-                            );
+                            });
                     },
                     onStatus: (status, relay) => {
                         if (!this.isCurrentGeneration(generation)) return;
@@ -337,6 +345,7 @@ export class NostrProvider extends Observable<string> {
         if (!this.isCurrentGeneration(generation)) return;
         if (event.pubkey === this.peerId || this.hasSeenEvent(event.id)) return;
         if (Math.abs(Math.floor(Date.now() / 1000) - event.created_at) > 120) return;
+        if (!hasValidSignalExpiration(event)) return;
 
         const eventTopic = getEventTopic(event);
         if (!eventTopic) return;
@@ -930,6 +939,18 @@ const createOfferId = (): string => {
     let result = "";
     for (const byte of bytes) result += byte.toString(16).padStart(2, "0");
     return result;
+};
+
+const hasValidSignalExpiration = (event: NostrEvent): boolean => {
+    const tags = event.tags.filter((tag) => tag[0] === "expiration");
+    if (tags.length !== 1 || tags[0]!.length !== 2) return false;
+    const value = tags[0]![1]!;
+    if (!/^(0|[1-9]\d*)$/.test(value)) return false;
+    const expiration = Number(value);
+    return (
+        Number.isSafeInteger(expiration) &&
+        expiration === event.created_at + signalExpirationSeconds
+    );
 };
 
 const isSignalPayload = (value: unknown): value is SignalPayload => {

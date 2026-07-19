@@ -113,6 +113,17 @@ class ThrowingPublishWebSocket extends RecoveryWebSocket {
     }
 }
 
+class TransientPublishWebSocket extends RecoveryWebSocket {
+    eventAttempts = 0;
+
+    send(data) {
+        if (JSON.parse(data)[0] === "EVENT" && ++this.eventAttempts === 1) {
+            throw new Error("transient publish failure");
+        }
+        super.send(data);
+    }
+}
+
 globalThis.RTCPeerConnection = FakePeerConnection;
 
 const { NostrProvider, createEvent, createIdentity, defaultRtcConfig } =
@@ -791,4 +802,83 @@ test("relay send exceptions emit one connection error", async (context) => {
     await provider.announce(provider.relayConnections[0]);
     assert.equal(errors.length, 1);
     provider.destroy();
+});
+test("transient initial publication failure starts bounded recovery", async (context) => {
+    RecoveryWebSocket.sockets.length = 0;
+    context.mock.method(Math, "random", () => 0);
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    const provider = new NostrProvider("transient-publication", new Y.Doc(), {
+        privateKey: privateKey(33),
+        relays: ["wss://relay.test"],
+        WebSocket: TransientPublishWebSocket,
+    });
+    context.after(() => provider.destroy());
+    await provider.ready;
+    const socket = RecoveryWebSocket.sockets[0];
+
+    socket.open();
+    while (!provider.announcementRetry?.timer) {
+        await new Promise((resolve) => setImmediate(resolve));
+    }
+    context.mock.timers.tick(375);
+    while (socket.eventAttempts < 2) await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(socket.readyState, TransientPublishWebSocket.OPEN);
+    assert.equal(socket.eventAttempts, 2);
+});
+
+test("signaling requires the protocol expiration tag", async () => {
+    const sender = createProvider(34);
+    const receiver = createProvider(35);
+    await Promise.all([sender.ready, receiver.ready]);
+    const relay = { url: "wss://relay.test", isOpen: () => true, publish: () => true };
+    let announcements = 0;
+    receiver.receiveAnnounce = async () => {
+        announcements++;
+    };
+    const event = await sender.createPayloadEvent(sender.roomTopic, {
+        v: 2,
+        type: "announce",
+    });
+    const expiration = event.tags.find((tag) => tag[0] === "expiration");
+    const withExpiration = (value) =>
+        event.tags.map((tag) => (tag[0] === "expiration" ? ["expiration", value] : tag));
+    const invalidTags = [
+        event.tags.filter((tag) => tag[0] !== "expiration"),
+        [...event.tags, expiration],
+        withExpiration("invalid"),
+        withExpiration(String(event.created_at + 121)),
+        withExpiration(`0${event.created_at + 120}`),
+        withExpiration(`+${event.created_at + 120}`),
+        withExpiration("9007199254740992"),
+    ];
+
+    for (const tags of invalidTags) await receiver.receiveEvent({ ...event, tags }, relay);
+    assert.equal(announcements, 0);
+    await receiver.receiveEvent(event, relay);
+    assert.equal(announcements, 1);
+    sender.destroy();
+    receiver.destroy();
+});
+
+test("relay event callback reports asynchronous failures", async (context) => {
+    RecoveryWebSocket.sockets.length = 0;
+    const provider = new NostrProvider("incoming-failure", new Y.Doc(), {
+        privateKey: privateKey(36),
+        relays: ["wss://relay.test"],
+        WebSocket: RecoveryWebSocket,
+    });
+    context.after(() => provider.destroy());
+    await provider.ready;
+    const errors = [];
+    provider.on("connection-error", (event) => errors.push(event));
+    provider.receiveEvent = async () => {
+        throw new Error("incoming failure");
+    };
+
+    provider.relayConnections[0].onEvent({}, provider.relayConnections[0]);
+    while (errors.length === 0) await new Promise((resolve) => setImmediate(resolve));
+
+    assert.match(String(errors[0].error), /incoming failure/);
+    assert.equal(errors[0].relay, "wss://relay.test");
 });

@@ -73,6 +73,7 @@ export class NostrRelay {
     readonly subscriptionId: string;
     destroyed = false;
     didOpen = false;
+    connected = false;
     reconnectDelay = 1000;
     socket: WebSocket | null = null;
     reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -139,7 +140,11 @@ export class NostrRelay {
             const reconnected = this.didOpen;
             this.didOpen = true;
             this.reconnectDelay = 1000;
-            this.subscribe();
+            if (!this.subscribe()) {
+                socket.close();
+                return;
+            }
+            this.connected = true;
             this.onStatus("connected", this);
             this.onOpen(this, reconnected);
         });
@@ -153,13 +158,16 @@ export class NostrRelay {
             if (socket !== this.socket || this.destroyed) return;
             clearTimeout(this.connectTimer);
             this.connectTimer = undefined;
-            this.onStatus("disconnected", this);
+            if (this.connected) {
+                this.connected = false;
+                this.onStatus("disconnected", this);
+            }
             this.scheduleReconnect();
         });
     }
 
-    subscribe(): void {
-        this.send([
+    subscribe(): boolean {
+        return this.send([
             "REQ",
             this.subscriptionId,
             {
@@ -240,6 +248,7 @@ export class NostrRelay {
     destroy(): void {
         if (this.destroyed) return;
         this.destroyed = true;
+        this.connected = false;
         clearTimeout(this.reconnectTimer);
         clearTimeout(this.connectTimer);
         this.connectTimer = undefined;

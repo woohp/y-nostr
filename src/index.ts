@@ -10,6 +10,7 @@ export {
     deriveRoomSecrets,
     encrypt,
     passwordKdfIterations,
+    signalExpirationSeconds,
     verifyEvent,
 } from "./crypto.js";
 export type { DebugEvent, NostrProviderOptions } from "./y-nostr.js";
