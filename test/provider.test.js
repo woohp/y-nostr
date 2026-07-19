@@ -669,54 +669,19 @@ test("owned awareness removal is sent before provider teardown", async () => {
     assert.equal(provider.awareness.getLocalState(), null);
 });
 
-test("known SCTP message limits fail before calling data channel send", async () => {
-    const provider = createProvider(27);
-    await provider.ready;
-    let sends = 0;
-    let destroyed = 0;
-    const peer = {
-        pc: { sctp: { maxMessageSize: 1 } },
-        send: () => {
-            sends++;
-            return true;
-        },
-        destroy: () => {
-            destroyed++;
-        },
-    };
-
-    assert.equal(provider.sendSyncStep1(peer), false);
-    assert.equal(sends, 0);
-    assert.equal(destroyed, 1);
-    provider.destroy();
-});
-test("fallback frame and buffered-amount limits are enforced", async () => {
+test("passes send safeguards to the WebRTC transport", async () => {
     const provider = new NostrProvider("limits-room", new Y.Doc(), {
-        privateKey: privateKey(28),
+        privateKey: privateKey(27),
         relays: [],
-        fallbackMaxMessageSize: 1,
-        maxBufferedAmount: 4,
+        fallbackMaxMessageSize: 123,
+        maxBufferedAmount: 456,
     });
     await provider.ready;
-    let destroyed = 0;
-    const fallbackPeer = {
-        send: () => true,
-        destroy: () => {
-            destroyed++;
-        },
-    };
-    assert.equal(provider.sendSyncStep1(fallbackPeer), false);
+    const peer = provider.createPeer("transport-peer", true);
 
-    const bufferedPeer = {
-        pc: { sctp: { maxMessageSize: 0 } },
-        channel: { bufferedAmount: 4 },
-        send: () => true,
-        destroy: () => {
-            destroyed++;
-        },
-    };
-    assert.equal(provider.sendSyncStep1(bufferedPeer), false);
-    assert.equal(destroyed, 2);
+    assert.equal(peer.fallbackMaxMessageSize, 123);
+    assert.equal(peer.maxBufferedAmount, 456);
+    peer.destroy();
     provider.destroy();
 });
 

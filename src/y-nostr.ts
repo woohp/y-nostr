@@ -547,6 +547,8 @@ export class NostrProvider extends Observable<string> {
             rtcConfig: this.rtcConfig,
             channelLabel: this.channelName,
             iceGatheringTimeout: this.offerTimeout,
+            fallbackMaxMessageSize: this.fallbackMaxMessageSize,
+            maxBufferedAmount: this.maxBufferedAmount,
             ...(this._RTCPeerConnection ? { RTCPeerConnection: this._RTCPeerConnection } : {}),
             onOpen: (peer) => this.onPeerOpen(peer, remotePeerId, initiator, generation),
             onMessage: (peer, data) => this.onPeerMessage(peer, remotePeerId, data, generation),
@@ -636,10 +638,6 @@ export class NostrProvider extends Observable<string> {
     }
 
     private sendProtocolMessage(peer: WebrtcDataPeer, message: Uint8Array<ArrayBuffer>): boolean {
-        if (!this.messageFitsPeer(peer, message)) {
-            peer.destroy();
-            return false;
-        }
         try {
             if (peer.send(message)) return true;
         } catch (error) {
@@ -689,7 +687,6 @@ export class NostrProvider extends Observable<string> {
         encoding.writeVarUint(encoder, messageDirect);
         encoding.writeVarUint8Array(encoder, message);
         const encoded = encoding.toUint8Array(encoder);
-        if (!this.messageFitsPeer(peer, encoded)) return false;
         try {
             return peer.send(encoded);
         } catch {
@@ -701,33 +698,6 @@ export class NostrProvider extends Observable<string> {
         for (const peer of this.peers.values()) {
             if (peer.connected) this.sendProtocolMessage(peer, message);
         }
-    }
-
-    private messageFitsPeer(peer: WebrtcDataPeer, message: Uint8Array<ArrayBuffer>): boolean {
-        const negotiatedMax = peer.pc?.sctp?.maxMessageSize;
-        const maxMessageSize =
-            negotiatedMax === 0
-                ? Number.POSITIVE_INFINITY
-                : (negotiatedMax ?? this.fallbackMaxMessageSize);
-        if (message.byteLength > maxMessageSize) {
-            this.emit("peer-error", [
-                new Error(
-                    `WebRTC message is ${message.byteLength} bytes, exceeding the ${maxMessageSize}-byte limit`,
-                ),
-            ]);
-            return false;
-        }
-
-        const bufferedAmount = peer.channel?.bufferedAmount ?? 0;
-        if (bufferedAmount + message.byteLength > this.maxBufferedAmount) {
-            this.emit("peer-error", [
-                new Error(
-                    `WebRTC buffered data would exceed the ${this.maxBufferedAmount}-byte limit`,
-                ),
-            ]);
-            return false;
-        }
-        return true;
     }
 
     emitDebug(event: DebugEvent): void {
