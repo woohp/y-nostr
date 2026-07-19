@@ -68,6 +68,43 @@ class SelectiveWebSocket {
     close() {}
 }
 
+class RecoveryWebSocket {
+    static OPEN = 1;
+    static sockets = [];
+    readyState = 0;
+    listeners = new Map();
+    sent = [];
+
+    constructor(url) {
+        this.url = url;
+        RecoveryWebSocket.sockets.push(this);
+    }
+
+    addEventListener(type, listener) {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+    }
+
+    dispatch(type, event = {}) {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+    }
+
+    send(data) {
+        this.sent.push(JSON.parse(data));
+    }
+
+    open() {
+        this.readyState = RecoveryWebSocket.OPEN;
+        this.dispatch("open");
+    }
+
+    close() {
+        this.readyState = 3;
+        this.dispatch("close");
+    }
+}
+
 globalThis.RTCPeerConnection = FakePeerConnection;
 
 const { NostrProvider, createEvent, createIdentity, defaultRtcConfig } =
@@ -409,6 +446,81 @@ test("recovery resumes when a pending peer disappears during offer creation", as
 
     assert.equal(provider.announcementRetry.paused, false);
     assert.ok(provider.announcementRetry.timer);
+});
+test("retries a dropped initial announcement after the first relay opens", async (context) => {
+    RecoveryWebSocket.sockets.length = 0;
+    const provider = new NostrProvider("recovery-room", new Y.Doc(), {
+        privateKey: privateKey(22),
+        relays: ["wss://relay.test"],
+        WebSocket: RecoveryWebSocket,
+    });
+    context.after(() => provider.destroy());
+    await provider.ready;
+    context.mock.method(Math, "random", () => 0);
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    const socket = RecoveryWebSocket.sockets[0];
+
+    socket.open();
+    const eventCount = () => socket.sent.filter((message) => message[0] === "EVENT").length;
+    while (eventCount() < 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(eventCount(), 1);
+
+    context.mock.timers.tick(375);
+    while (eventCount() < 2) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(eventCount(), 2);
+});
+
+test("protocol send failures destroy only the failed peer", async () => {
+    const provider = createProvider(23);
+    await provider.ready;
+    let initialSends = 0;
+    let initialDestroyed = 0;
+    const initialPeer = {
+        send: () => {
+            initialSends++;
+            return false;
+        },
+        destroy: () => {
+            initialDestroyed++;
+            provider.removePeer(initialPeer, "initial-peer");
+        },
+    };
+
+    provider.onPeerOpen(initialPeer, "initial-peer", true);
+    assert.equal(initialSends, 1);
+    assert.equal(initialDestroyed, 1);
+    assert.equal(provider.peers.has("initial-peer"), false);
+
+    let failedDestroyed = 0;
+    let healthySends = 0;
+    const failedPeer = {
+        connected: true,
+        send: () => {
+            throw new Error("incremental send failed");
+        },
+        destroy: () => {
+            failedDestroyed++;
+            provider.removePeer(failedPeer, "failed-peer");
+        },
+    };
+    const healthyPeer = {
+        connected: true,
+        send: () => {
+            healthySends++;
+            return true;
+        },
+        destroy: () => provider.removePeer(healthyPeer, "healthy-peer"),
+    };
+    provider.peers.set("failed-peer", failedPeer);
+    provider.peers.set("healthy-peer", healthyPeer);
+
+    provider.doc.getText("updates").insert(0, "repair me");
+
+    assert.equal(failedDestroyed, 1);
+    assert.equal(provider.peers.has("failed-peer"), false);
+    assert.equal(healthySends, 1);
+    assert.equal(provider.peers.has("healthy-peer"), true);
+    provider.destroy();
 });
 
 test("repeated offer failures preserve the global retry budget", async (context) => {

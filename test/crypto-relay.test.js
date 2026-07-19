@@ -163,3 +163,34 @@ test("ignores malformed tags and events completed after destruction", async () =
 
     assert.deepEqual(received, []);
 });
+test("retries after a synchronous WebSocket reconnect failure", (context) => {
+    class ReconnectWebSocket extends MockWebSocket {
+        static attempts = 0;
+
+        constructor(url) {
+            ReconnectWebSocket.attempts++;
+            if (ReconnectWebSocket.attempts > 1) throw new Error("constructor failed");
+            super(url);
+        }
+    }
+
+    MockWebSocket.sockets.length = 0;
+    context.mock.method(Math, "random", () => 0);
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    const errors = [];
+    const relay = new NostrRelay("wss://relay.test", {
+        topics: ["topic"],
+        onEvent: () => {},
+        onError: (error) => errors.push(error),
+        WebSocket: ReconnectWebSocket,
+    });
+    const socket = MockWebSocket.sockets[0];
+    socket.open();
+    socket.dispatch("close");
+
+    context.mock.timers.tick(750);
+
+    assert.match(String(errors[0]), /constructor failed/);
+    assert.ok(relay.reconnectTimer);
+    relay.destroy();
+});

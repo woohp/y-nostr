@@ -115,7 +115,12 @@ const readMessage = (
     if (messageType === messageSync) {
         encoding.writeVarUint(encoder, messageSync);
         const syncType = syncProtocol.readSyncMessage(decoder, encoder, provider.doc, peer);
-        if (encoding.length(encoder) > 1) peer.send(encoding.toUint8Array(encoder));
+        if (
+            encoding.length(encoder) > 1 &&
+            !provider.sendProtocolMessage(peer, encoding.toUint8Array(encoder))
+        ) {
+            return false;
+        }
         return syncType === syncProtocol.messageYjsSyncStep2;
     } else if (messageType === messageAwareness) {
         awarenessProtocol.applyAwarenessUpdate(
@@ -162,6 +167,8 @@ export class NostrProvider extends Observable<string> {
     private readonly seenEvents = new Set<string>();
     private readonly seenEventQueue: string[] = [];
     private readonly syncedPeers = new Set<WebrtcDataPeer>();
+    private readonly openRelays = new Set<NostrRelay>();
+    private recoveryStartPending = false;
     private announcementRetry: {
         attempt: number;
         generation: number;
@@ -251,27 +258,44 @@ export class NostrProvider extends Observable<string> {
                     onEvent: (event, relay) => void this.receiveEvent(event, relay, generation),
                     onOpen: (relay, reconnected) => {
                         if (!this.isCurrentGeneration(generation)) return;
-                        if (reconnected) {
-                            void this.announce(relay);
-                        } else {
-                            void initialAnnouncement
-                                .then((event) => {
-                                    if (!this.isCurrentGeneration(generation)) return;
-                                    if (Math.floor(Date.now() / 1000) - event.created_at > 90) {
-                                        return this.announce(relay);
-                                    }
-                                    relay.publish(event);
-                                    return undefined;
-                                })
-                                .catch((error: unknown) =>
-                                    this.emit("connection-error", [{ error, relay: relay.url }]),
-                                );
-                        }
+                        const publication = reconnected
+                            ? this.announce(relay)
+                            : initialAnnouncement.then((event) => {
+                                  if (!this.isCurrentGeneration(generation)) return false;
+                                  if (Math.floor(Date.now() / 1000) - event.created_at > 90) {
+                                      return this.announce(relay);
+                                  }
+                                  return relay.publish(event);
+                              });
+                        void publication
+                            .then((published) => {
+                                if (
+                                    published &&
+                                    this.recoveryStartPending &&
+                                    this.openRelays.size > 0 &&
+                                    this.isCurrentGeneration(generation)
+                                ) {
+                                    this.recoveryStartPending = false;
+                                    this.startAnnouncementRecoveryEpisode();
+                                }
+                            })
+                            .catch((error: unknown) =>
+                                this.emit("connection-error", [{ error, relay: relay.url }]),
+                            );
                     },
                     onStatus: (status, relay) => {
-                        if (this.isCurrentGeneration(generation)) {
-                            this.emit("status", [{ status, relay: relay.url }]);
+                        if (!this.isCurrentGeneration(generation)) return;
+                        if (status === "connected") {
+                            if (this.openRelays.size === 0) this.recoveryStartPending = true;
+                            this.openRelays.add(relay);
+                        } else {
+                            this.openRelays.delete(relay);
+                            if (this.openRelays.size === 0) {
+                                this.pauseAnnouncementRetry();
+                                this.recoveryStartPending = true;
+                            }
                         }
+                        this.emit("status", [{ status, relay: relay.url }]);
                     },
                     onError: (error, relay) => {
                         if (this.isCurrentGeneration(generation)) {
@@ -287,9 +311,9 @@ export class NostrProvider extends Observable<string> {
         }
     }
 
-    async announce(relay?: NostrRelay): Promise<void> {
-        if (!this.shouldConnect || !this.roomTopic) return;
-        await this.publishPayload(
+    async announce(relay?: NostrRelay): Promise<boolean> {
+        if (!this.shouldConnect || !this.roomTopic) return false;
+        return this.publishPayload(
             this.roomTopic,
             { v: protocolVersion, type: "announce" },
             relay ? [relay] : this.relayConnections,
@@ -410,11 +434,13 @@ export class NostrProvider extends Observable<string> {
             return;
         }
 
+        this.pauseAnnouncementRetry();
         let peer: WebrtcDataPeer;
         try {
             peer = this.createPeer(peerId, false);
         } catch (error) {
             this.emit("peer-error", [error]);
+            this.resumeAnnouncementRetry();
             return;
         }
         const pending: PendingPeer = { peer, relay, role: "answering", offerId };
@@ -422,7 +448,11 @@ export class NostrProvider extends Observable<string> {
 
         try {
             const answer = await peer.acceptOffer(signal);
-            if (this.pendingPeers.get(peerId)?.peer !== peer) return;
+            if (this.pendingPeers.get(peerId)?.peer !== peer) {
+                this.resumeAnnouncementRetry();
+                return;
+            }
+            this.cancelAnnouncementRetry();
             const topic = await createPeerTopic(this.roomTopic!, peerId);
             await this.publishPayload(
                 topic,
@@ -440,6 +470,7 @@ export class NostrProvider extends Observable<string> {
         } catch (error) {
             this.emit("peer-error", [error]);
             peer.destroy();
+            this.resumeAnnouncementRetry();
         }
     }
 
@@ -502,8 +533,7 @@ export class NostrProvider extends Observable<string> {
         this.peers.set(peerId, peer);
         this.cancelAnnouncementRetry();
         this.emitDebug({ type: "peer-connect", peerId, initiator });
-        this.sendSyncStep1(peer);
-        this.sendAwareness(peer);
+        if (!this.sendSyncStep1(peer) || !this.sendAwareness(peer)) return;
         this.emit("peers", [Array.from(this.peers.keys())]);
     }
 
@@ -551,23 +581,33 @@ export class NostrProvider extends Observable<string> {
         }
     }
 
-    sendSyncStep1(peer: WebrtcDataPeer): void {
+    sendProtocolMessage(peer: WebrtcDataPeer, message: Uint8Array<ArrayBuffer>): boolean {
+        try {
+            if (peer.send(message)) return true;
+        } catch (error) {
+            this.emit("peer-error", [error]);
+        }
+        peer.destroy();
+        return false;
+    }
+
+    sendSyncStep1(peer: WebrtcDataPeer): boolean {
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, messageSync);
         syncProtocol.writeSyncStep1(encoder, this.doc);
-        peer.send(encoding.toUint8Array(encoder));
+        return this.sendProtocolMessage(peer, encoding.toUint8Array(encoder));
     }
 
-    sendAwareness(peer: WebrtcDataPeer): void {
+    sendAwareness(peer: WebrtcDataPeer): boolean {
         const states = Array.from(this.awareness.getStates().keys());
-        if (states.length === 0) return;
+        if (states.length === 0) return true;
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, messageAwareness);
         encoding.writeVarUint8Array(
             encoder,
             awarenessProtocol.encodeAwarenessUpdate(this.awareness, states),
         );
-        peer.send(encoding.toUint8Array(encoder));
+        return this.sendProtocolMessage(peer, encoding.toUint8Array(encoder));
     }
 
     broadcastSyncUpdate(update: Uint8Array): void {
@@ -590,12 +630,16 @@ export class NostrProvider extends Observable<string> {
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, messageDirect);
         encoding.writeVarUint8Array(encoder, message);
-        return peer.send(encoding.toUint8Array(encoder));
+        try {
+            return peer.send(encoding.toUint8Array(encoder));
+        } catch {
+            return false;
+        }
     }
 
     broadcast(message: Uint8Array<ArrayBuffer>): void {
         for (const peer of this.peers.values()) {
-            if (peer.connected) peer.send(message);
+            if (peer.connected) this.sendProtocolMessage(peer, message);
         }
     }
 
@@ -609,6 +653,8 @@ export class NostrProvider extends Observable<string> {
         this.connectionPromise = null;
         this.connectionGeneration++;
         this.cancelAnnouncementRetry();
+        this.openRelays.clear();
+        this.recoveryStartPending = false;
         for (const relay of this.relayConnections) relay.destroy();
         this.relayConnections = [];
         for (const peer of this.peers.values()) peer.destroy();
@@ -657,6 +703,15 @@ export class NostrProvider extends Observable<string> {
         this.emit("synced", [synced]);
     }
 
+    private startAnnouncementRecoveryEpisode(): void {
+        if (this.openRelays.size === 0) {
+            this.recoveryStartPending = true;
+            return;
+        }
+        this.cancelAnnouncementRetry();
+        this.scheduleAnnouncementRetry();
+    }
+
     private scheduleAnnouncementRetry(): void {
         if (!this.shouldConnect || this.destroyed || this.announcementRetry) return;
         this.announcementRetry = {
@@ -699,7 +754,7 @@ export class NostrProvider extends Observable<string> {
 
     private resumeAnnouncementRetry(): void {
         if (!this.announcementRetry) {
-            this.scheduleAnnouncementRetry();
+            this.startAnnouncementRecoveryEpisode();
             return;
         }
         this.announcementRetry.paused = false;
@@ -721,7 +776,7 @@ export class NostrProvider extends Observable<string> {
         pending.timer = setTimeout(() => {
             if (this.pendingPeers.get(peerId) !== pending) return;
             pending.peer.destroy();
-            void this.announce();
+            this.startAnnouncementRecoveryEpisode();
         }, this.signalTimeout);
     }
 
@@ -743,20 +798,24 @@ export class NostrProvider extends Observable<string> {
         topic: string,
         payload: OutgoingSignalPayload,
         relays: readonly NostrRelay[] = this.relayConnections,
-    ): Promise<void> {
-        if (!this.shouldConnect) return;
+    ): Promise<boolean> {
+        if (!this.shouldConnect) return false;
         const generation = this.connectionGeneration;
         try {
             const event = await this.createPayloadEvent(topic, payload);
-            if (!this.isCurrentGeneration(generation)) return;
-            for (const relay of relays) relay.publish(event);
+            if (!this.isCurrentGeneration(generation)) return false;
+            let published = false;
+            for (const relay of relays) published = relay.publish(event) || published;
+            if (!published) return false;
             this.emitDebug({
                 type: "signal-sent",
                 signalType: payload.type,
                 relays: relays.map((relay) => relay.url),
             });
+            return true;
         } catch (error) {
             this.emit("connection-error", [{ error }]);
+            return false;
         }
     }
 

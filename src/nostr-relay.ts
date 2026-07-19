@@ -76,6 +76,10 @@ export class NostrRelay {
     reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
     constructor(url: string, opts: NostrRelayOptions) {
+        const parsedUrl = new URL(url);
+        if (parsedUrl.protocol !== "ws:" && parsedUrl.protocol !== "wss:") {
+            throw new Error(`Invalid relay URL: ${url}`);
+        }
         this.url = url;
         this.topics = opts.topics;
         this.onEvent = opts.onEvent;
@@ -94,7 +98,16 @@ export class NostrRelay {
             return;
         }
 
-        const socket = (this.socket = new this.WebSocket(this.url));
+        let socket: WebSocket;
+        try {
+            socket = new this.WebSocket(this.url);
+            this.socket = socket;
+        } catch (error) {
+            this.socket = null;
+            this.onError(error, this);
+            this.scheduleReconnect();
+            return;
+        }
         socket.addEventListener("open", () => {
             if (socket !== this.socket || this.destroyed) return;
             const reconnected = this.didOpen;
@@ -129,8 +142,8 @@ export class NostrRelay {
         ]);
     }
 
-    publish(event: NostrEvent): void {
-        this.send(["EVENT", event]);
+    publish(event: NostrEvent): boolean {
+        return this.send(["EVENT", event]);
     }
 
     async handleMessage(
@@ -181,8 +194,15 @@ export class NostrRelay {
         this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30000);
     }
 
-    send(message: unknown[]): void {
-        if (this.isOpen()) this.socket.send(JSON.stringify(message));
+    send(message: unknown[]): boolean {
+        if (!this.isOpen()) return false;
+        try {
+            this.socket.send(JSON.stringify(message));
+            return true;
+        } catch (error) {
+            this.onError(error, this);
+            return false;
+        }
     }
 
     isOpen(): this is this & { socket: WebSocket; WebSocket: typeof WebSocket } {
