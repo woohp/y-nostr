@@ -30,7 +30,7 @@
     "dependencies": {
         "@noble/secp256k1": "^3.1.0",
         "lib0": "^0.2.114",
-        "webrtc-data-peer": "git+https://github.com/woohp/webrtc-data-peer.git#9dabb5b",
+        "webrtc-data-peer": "git+https://github.com/woohp/webrtc-data-peer.git#a8a999d",
         "y-protocols": "^1.0.6",
         "yjs": "^13.6.27"
     },

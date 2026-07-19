@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import * as Y from "yjs";
 import { Awareness } from "y-protocols/awareness";
+import * as syncProtocol from "y-protocols/sync";
+import * as encoding from "lib0/encoding";
 
 class FakeDataChannel {
     binaryType = "blob";
@@ -190,6 +192,8 @@ test("sendToPeer sends a directed binary message to only the selected peer", asy
     const recipient = createProvider(4);
     await recipient.ready;
     const peer = recipient.createPeer(sender.peerId, true);
+    peer.channel.markOpen();
+    recipient.peers.set(sender.peerId, peer);
     const received = new Promise((resolve) => {
         recipient.on("direct-message", (peerId, payload) => resolve({ peerId, payload }));
     });
@@ -318,6 +322,8 @@ test("reports malformed peer frames and destroys the peer", async () => {
     const provider = createProvider(13);
     await provider.ready;
     const peer = provider.createPeer("remote", true);
+    peer.channel.markOpen();
+    provider.peers.set("remote", peer);
     const error = new Promise((resolve) => provider.on("peer-error", resolve));
 
     provider.onPeerMessage(peer, "remote", new ArrayBuffer(0));
@@ -342,6 +348,8 @@ test("sets synced only after Sync Step 2 and synchronizes documents", async () =
     assert.equal(second.synced, false);
     firstPeer.channel.markOpen();
     secondPeer.channel.markOpen();
+    first.peers.set(second.peerId, firstPeer);
+    second.peers.set(first.peerId, secondPeer);
     firstPeer.channel.dispatchOpen();
     assert.equal(first.synced, true);
     assert.equal(second.synced, false);
@@ -846,4 +854,60 @@ test("relay event callback reports asynchronous failures", async (context) => {
 
     assert.match(String(errors[0].error), /incoming failure/);
     assert.equal(errors[0].relay, "wss://relay.test");
+});
+
+test("disconnect cancels active ICE negotiation without peer errors or recovery", async () => {
+    class GatheringPeerConnection extends FakePeerConnection {
+        iceGatheringState = "gathering";
+    }
+    const relay = { url: "wss://relay.test", isOpen: () => true, publish: () => true };
+    const cases = [
+        (provider) => provider.receiveAnnounce("f".repeat(64), relay),
+        (provider) =>
+            provider.receiveOffer(
+                "0".repeat(64),
+                "incoming-offer",
+                { type: "offer", sdp: "incoming" },
+                relay,
+            ),
+    ];
+
+    for (const [index, startNegotiation] of cases.entries()) {
+        const provider = new NostrProvider(`cancel-ice-${index}`, new Y.Doc(), {
+            privateKey: privateKey(38 + index),
+            relays: [],
+            offerTimeout: 1000,
+            RTCPeerConnection: GatheringPeerConnection,
+        });
+        await provider.ready;
+        const errors = [];
+        provider.on("peer-error", (error) => errors.push(error));
+        const negotiating = startNegotiation(provider);
+        while (provider.pendingPeers.size === 0) await Promise.resolve();
+
+        provider.disconnect();
+        await negotiating;
+
+        assert.deepEqual(errors, []);
+        assert.equal(provider.pendingPeers.size, 0);
+        assert.equal(provider.recoveryStartPending, false);
+        provider.destroy();
+    }
+});
+test("late Sync Step 2 from a removed peer cannot restore synced", async () => {
+    const provider = createProvider(37);
+    await provider.ready;
+    const peerId = "removed-peer";
+    const peer = { connected: true, send: () => true, destroy: () => {} };
+    provider.peers.set(peerId, peer);
+    provider.removePeer(peer, peerId);
+    const encoder = encoding.createEncoder();
+    encoding.writeVarUint(encoder, 0);
+    syncProtocol.writeSyncStep2(encoder, provider.doc);
+
+    provider.onPeerMessage(peer, peerId, encoding.toUint8Array(encoder).buffer);
+
+    assert.equal(provider.synced, false);
+    assert.equal(provider.syncedPeers.size, 0);
+    provider.destroy();
 });

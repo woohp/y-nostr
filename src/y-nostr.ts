@@ -379,6 +379,7 @@ export class NostrProvider extends Observable<string> {
         isResponse: boolean = false,
     ): Promise<void> {
         if (!this.shouldConnect || this.destroyed) return;
+        const generation = this.connectionGeneration;
         if (this.peers.has(peerId) || this.pendingPeers.has(peerId) || !this.hasCapacity()) {
             return;
         }
@@ -446,6 +447,12 @@ export class NostrProvider extends Observable<string> {
             this.startSignalTimeout(peerId, pending);
             this.emitDebug({ type: "offer-sent", peerId, offerId, relay: relay.url });
         } catch (error) {
+            if (
+                !this.isCurrentGeneration(generation) ||
+                this.pendingPeers.get(peerId)?.peer !== peer
+            ) {
+                return;
+            }
             this.emit("peer-error", [error]);
             peer.destroy();
             this.resumeAnnouncementRetry();
@@ -459,6 +466,7 @@ export class NostrProvider extends Observable<string> {
         relay: NostrRelay,
     ): Promise<void> {
         if (!this.shouldConnect || this.destroyed) return;
+        const generation = this.connectionGeneration;
         if (
             peerId >= this.peerId ||
             this.peers.has(peerId) ||
@@ -518,6 +526,12 @@ export class NostrProvider extends Observable<string> {
             this.startSignalTimeout(peerId, pending);
             this.emitDebug({ type: "answer-sent", peerId, offerId, relay: relay.url });
         } catch (error) {
+            if (
+                !this.isCurrentGeneration(generation) ||
+                this.pendingPeers.get(peerId)?.peer !== peer
+            ) {
+                return;
+            }
             this.emit("peer-error", [error]);
             peer.destroy();
             this.resumeAnnouncementRetry();
@@ -530,11 +544,18 @@ export class NostrProvider extends Observable<string> {
         signal: RTCSessionDescriptionInit,
     ): Promise<void> {
         if (!this.shouldConnect || this.destroyed) return;
+        const generation = this.connectionGeneration;
         const pending = this.pendingPeers.get(peerId);
         if (!pending || pending.role !== "offering" || pending.offerId !== offerId) return;
         try {
             await pending.peer.acceptAnswer(signal);
         } catch (error) {
+            if (
+                !this.isCurrentGeneration(generation) ||
+                this.pendingPeers.get(peerId) !== pending
+            ) {
+                return;
+            }
             this.emit("peer-error", [error]);
             pending.peer.destroy();
         }
@@ -596,6 +617,7 @@ export class NostrProvider extends Observable<string> {
         generation: number = this.connectionGeneration,
     ): void {
         if (!this.isCurrentGeneration(generation)) return;
+        if (this.peers.get(peerId) !== peer || !peer.connected) return;
         try {
             if (
                 readMessage(this, peer, peerId, data, (message) =>
