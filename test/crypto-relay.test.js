@@ -194,3 +194,23 @@ test("retries after a synchronous WebSocket reconnect failure", (context) => {
     assert.ok(relay.reconnectTimer);
     relay.destroy();
 });
+test("times out a WebSocket that never opens and schedules reconnect", (context) => {
+    MockWebSocket.sockets.length = 0;
+    context.mock.method(Math, "random", () => 0);
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    const errors = [];
+    const relay = new NostrRelay("wss://relay.test", {
+        topics: ["topic"],
+        onEvent: () => {},
+        onError: (error) => errors.push(error),
+        connectTimeout: 100,
+        WebSocket: MockWebSocket,
+    });
+
+    context.mock.timers.tick(100);
+
+    assert.match(String(errors[0]), /connection timed out/);
+    assert.equal(relay.socket, null);
+    assert.ok(relay.reconnectTimer);
+    relay.destroy();
+});

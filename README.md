@@ -49,7 +49,9 @@ When using the public crypto helpers, prefer `deriveRoomSecrets(roomName, passwo
 
 Signaling protocol v2 encodes fields as UTF-8 strings prefixed by unsigned 32-bit big-endian lengths. It applies PBKDF2-SHA-256 to the password with 210,000 iterations and salt `["y-nostr", "v2", "room", roomName]`, then uses HKDF-SHA-256 with that salt and the labels `["y-nostr", "v2", "topic"]` and `["y-nostr", "v2", "aes-gcm"]`. Encrypted signaling includes and verifies the event signer and its single `x` topic.
 
-Call `provider.destroy()` when you're done. `disconnect()` followed by `connect()` is supported. Pass `rtcConfig` if you need your own STUN/TURN servers.
+Call `provider.destroy()` when you're done. `disconnect()` followed by `connect()` is supported. Pass `rtcConfig` if you need your own STUN/TURN servers, or `relayConnectTimeout` to change the 10-second relay opening timeout.
+
+WebRTC messages are sent as single data-channel frames. The provider uses the negotiated SCTP `maxMessageSize`, falling back to 256 KiB when unavailable, and rejects sends that would raise `bufferedAmount` above 4 MiB. Override these safeguards with `fallbackMaxMessageSize` and `maxBufferedAmount`. Fragmentation, large-document synchronization beyond the single-frame limit, sustained burst traffic, and outbound queueing are intentionally unsupported.
 
 ```sh
 npm run check

@@ -57,6 +57,7 @@ export interface NostrRelayOptions {
     onOpen?: (relay: NostrRelay, reconnected: boolean) => void;
     onStatus?: (status: "connected" | "disconnected", relay: NostrRelay) => void;
     onError?: (error: unknown, relay: NostrRelay) => void;
+    connectTimeout?: number;
     WebSocket?: typeof WebSocket;
 }
 
@@ -68,12 +69,14 @@ export class NostrRelay {
     readonly onStatus: NonNullable<NostrRelayOptions["onStatus"]>;
     readonly onError: NonNullable<NostrRelayOptions["onError"]>;
     readonly WebSocket?: typeof WebSocket;
+    readonly connectTimeout: number;
     readonly subscriptionId: string;
     destroyed = false;
     didOpen = false;
     reconnectDelay = 1000;
     socket: WebSocket | null = null;
     reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    connectTimer: ReturnType<typeof setTimeout> | undefined;
 
     constructor(url: string, opts: NostrRelayOptions) {
         const parsedUrl = new URL(url);
@@ -87,12 +90,15 @@ export class NostrRelay {
         this.onStatus = opts.onStatus ?? (() => {});
         this.onError = opts.onError ?? (() => {});
         this.WebSocket = opts.WebSocket ?? globalThis.WebSocket;
+        this.connectTimeout = opts.connectTimeout ?? 10000;
         this.subscriptionId = createSubscriptionId();
         this.connect();
     }
 
     connect(): void {
         if (this.destroyed) return;
+        clearTimeout(this.connectTimer);
+        this.connectTimer = undefined;
         if (!this.WebSocket) {
             this.onError(new Error("WebSocket is not available"), this);
             return;
@@ -108,8 +114,28 @@ export class NostrRelay {
             this.scheduleReconnect();
             return;
         }
+        this.connectTimer = setTimeout(() => {
+            if (
+                socket !== this.socket ||
+                this.destroyed ||
+                socket.readyState === this.WebSocket!.OPEN
+            ) {
+                return;
+            }
+            this.socket = null;
+            this.connectTimer = undefined;
+            this.onError(new Error(`WebSocket connection timed out: ${this.url}`), this);
+            try {
+                socket.close();
+            } catch {
+                // The reconnect below is still required if closing the stale socket fails.
+            }
+            this.scheduleReconnect();
+        }, this.connectTimeout);
         socket.addEventListener("open", () => {
             if (socket !== this.socket || this.destroyed) return;
+            clearTimeout(this.connectTimer);
+            this.connectTimer = undefined;
             const reconnected = this.didOpen;
             this.didOpen = true;
             this.reconnectDelay = 1000;
@@ -125,6 +151,8 @@ export class NostrRelay {
         });
         socket.addEventListener("close", () => {
             if (socket !== this.socket || this.destroyed) return;
+            clearTimeout(this.connectTimer);
+            this.connectTimer = undefined;
             this.onStatus("disconnected", this);
             this.scheduleReconnect();
         });
@@ -213,6 +241,8 @@ export class NostrRelay {
         if (this.destroyed) return;
         this.destroyed = true;
         clearTimeout(this.reconnectTimer);
+        clearTimeout(this.connectTimer);
+        this.connectTimer = undefined;
         if (this.isOpen()) this.send(["CLOSE", this.subscriptionId]);
         this.socket?.close();
         this.socket = null;
