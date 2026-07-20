@@ -13,5 +13,5 @@ export {
     signalExpirationSeconds,
     verifyEvent,
 } from "./crypto.js";
-export type { DebugEvent, NostrProviderOptions } from "./y-nostr.js";
+export type { DebugEvent, NostrProviderEvents, NostrProviderOptions } from "./y-nostr.js";
 export type { NostrEvent, NostrIdentity, RoomSecrets } from "./crypto.js";

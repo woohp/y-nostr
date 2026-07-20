@@ -4,7 +4,7 @@ import * as awarenessProtocol from "y-protocols/awareness";
 import type { Awareness } from "y-protocols/awareness";
 import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
-import { Observable } from "lib0/observable";
+import { ObservableV2 } from "lib0/observable";
 import {
     createEvent,
     createIdentity,
@@ -107,6 +107,16 @@ export interface DebugEvent {
     [key: string]: unknown;
 }
 
+export interface NostrProviderEvents {
+    status: (event: { status: "connected" | "disconnected"; relay: string }) => void;
+    peers: (peerIds: string[]) => void;
+    synced: (synced: boolean) => void;
+    "connection-error": (event: { error: unknown; relay?: string }) => void;
+    "peer-error": (error: unknown) => void;
+    "direct-message": (peerId: string, message: Uint8Array) => void;
+    debug: (event: DebugEvent) => void;
+}
+
 const readMessage = (
     provider: NostrProvider,
     peer: WebrtcDataPeer,
@@ -139,7 +149,7 @@ const readMessage = (
     return false;
 };
 
-export class NostrProvider extends Observable<string> {
+export class NostrProvider extends ObservableV2<NostrProviderEvents> {
     readonly roomName: string;
     readonly doc: Y.Doc;
     readonly relays: readonly string[];
