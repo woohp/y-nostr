@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createWebSocketHarness } from "../test-support/websocket.js";
 
 const {
     createEvent,
@@ -58,52 +59,16 @@ test("derives stable room and peer topics and encrypts signaling", async () => {
     await assert.rejects(decrypt(await deriveEncryptionKey("room", "wrong"), encrypted));
 });
 
-class MockWebSocket {
-    static OPEN = 1;
-    static sockets = [];
-    readyState = 0;
-    listeners = new Map();
-    sent = [];
-
-    constructor(url) {
-        this.url = url;
-        MockWebSocket.sockets.push(this);
-    }
-
-    addEventListener(type, listener) {
-        const listeners = this.listeners.get(type) ?? [];
-        listeners.push(listener);
-        this.listeners.set(type, listeners);
-    }
-
-    dispatch(type, event = {}) {
-        for (const listener of this.listeners.get(type) ?? []) listener(event);
-    }
-
-    send(data) {
-        this.sent.push(JSON.parse(data));
-    }
-
-    close() {
-        this.readyState = 3;
-        this.dispatch("close");
-    }
-
-    open() {
-        this.readyState = MockWebSocket.OPEN;
-        this.dispatch("open");
-    }
-}
-
-test("subscribes, verifies relay events, and closes cleanly", async () => {
-    MockWebSocket.sockets.length = 0;
+test("subscribes, verifies relay events, and closes cleanly", async (context) => {
+    const { WebSocket, sockets } = createWebSocketHarness();
     const received = [];
     const relay = new NostrRelay("wss://relay.test", {
         topics: ["topic"],
         onEvent: (event) => received.push(event),
-        WebSocket: MockWebSocket,
+        WebSocket,
     });
-    const socket = MockWebSocket.sockets[0];
+    context.after(() => relay.destroy());
+    const socket = sockets[0];
     socket.open();
 
     assert.equal(socket.sent[0][0], "REQ");
@@ -130,15 +95,16 @@ test("subscribes, verifies relay events, and closes cleanly", async () => {
     assert.equal(relay.connected, false);
     assert.equal(relay.reconnectTimer, undefined);
 });
-test("ignores malformed tags and events completed after destruction", async () => {
-    MockWebSocket.sockets.length = 0;
+test("ignores malformed tags and events completed after destruction", async (context) => {
+    const { WebSocket, sockets } = createWebSocketHarness();
     const received = [];
     const relay = new NostrRelay("wss://relay.test", {
         topics: ["topic"],
         onEvent: (event) => received.push(event),
-        WebSocket: MockWebSocket,
+        WebSocket,
     });
-    const socket = MockWebSocket.sockets[0];
+    context.after(() => relay.destroy());
+    const socket = sockets[0];
     socket.open();
 
     socket.dispatch("message", {
@@ -166,7 +132,8 @@ test("ignores malformed tags and events completed after destruction", async () =
     assert.deepEqual(received, []);
 });
 test("retries after a synchronous WebSocket reconnect failure", (context) => {
-    class ReconnectWebSocket extends MockWebSocket {
+    const { WebSocket, sockets } = createWebSocketHarness();
+    class ReconnectWebSocket extends WebSocket {
         static attempts = 0;
 
         constructor(url) {
@@ -176,7 +143,6 @@ test("retries after a synchronous WebSocket reconnect failure", (context) => {
         }
     }
 
-    MockWebSocket.sockets.length = 0;
     context.mock.method(Math, "random", () => 0);
     context.mock.timers.enable({ apis: ["setTimeout"] });
     const errors = [];
@@ -186,7 +152,8 @@ test("retries after a synchronous WebSocket reconnect failure", (context) => {
         onError: (error) => errors.push(error),
         WebSocket: ReconnectWebSocket,
     });
-    const socket = MockWebSocket.sockets[0];
+    context.after(() => relay.destroy());
+    const socket = sockets[0];
     socket.open();
     socket.dispatch("close");
 
@@ -194,10 +161,9 @@ test("retries after a synchronous WebSocket reconnect failure", (context) => {
 
     assert.match(String(errors[0]), /constructor failed/);
     assert.ok(relay.reconnectTimer);
-    relay.destroy();
 });
 test("times out a WebSocket that never opens and schedules reconnect", (context) => {
-    MockWebSocket.sockets.length = 0;
+    const { WebSocket } = createWebSocketHarness();
     context.mock.method(Math, "random", () => 0);
     context.mock.timers.enable({ apis: ["setTimeout"] });
     const errors = [];
@@ -206,25 +172,25 @@ test("times out a WebSocket that never opens and schedules reconnect", (context)
         onEvent: () => {},
         onError: (error) => errors.push(error),
         connectTimeout: 100,
-        WebSocket: MockWebSocket,
+        WebSocket,
     });
+    context.after(() => relay.destroy());
 
     context.mock.timers.tick(100);
 
     assert.match(String(errors[0]), /connection timed out/);
     assert.equal(relay.socket, null);
     assert.ok(relay.reconnectTimer);
-    relay.destroy();
 });
 test("reconnects when the relay subscription send fails", (context) => {
-    class SubscriptionFailureWebSocket extends MockWebSocket {
+    const { WebSocket, sockets } = createWebSocketHarness();
+    class SubscriptionFailureWebSocket extends WebSocket {
         send(data) {
             if (JSON.parse(data)[0] === "REQ") throw new Error("subscription failed");
             super.send(data);
         }
     }
 
-    MockWebSocket.sockets.length = 0;
     context.mock.method(Math, "random", () => 0);
     context.mock.timers.enable({ apis: ["setTimeout"] });
     const statuses = [];
@@ -235,12 +201,12 @@ test("reconnects when the relay subscription send fails", (context) => {
         onError: () => {},
         WebSocket: SubscriptionFailureWebSocket,
     });
-    const socket = MockWebSocket.sockets[0];
-    socket.readyState = MockWebSocket.OPEN;
+    context.after(() => relay.destroy());
+    const socket = sockets[0];
+    socket.readyState = WebSocket.OPEN;
 
     socket.dispatch("open");
 
     assert.deepEqual(statuses, []);
     assert.ok(relay.reconnectTimer);
-    relay.destroy();
 });

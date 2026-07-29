@@ -44,6 +44,9 @@ type PeerId = string;
 type DocUpdateHandler = (update: Uint8Array, origin: unknown) => void;
 type AwarenessUpdate = { added: number[]; updated: number[]; removed: number[] };
 type AwarenessUpdateHandler = (update: AwarenessUpdate, origin: unknown) => void;
+type PeerRole = "offering" | "answering";
+type NegotiationRole = PeerRole | "self";
+type PeerMessageResult = "handled" | "sync-step-2";
 interface SignalBase {
     v: number;
     from: PeerId;
@@ -77,9 +80,9 @@ type OutgoingSignalPayload =
 interface PendingPeer {
     peer: WebrtcDataPeer;
     relay: NostrRelay;
-    role: "offering" | "answering";
+    role: PeerRole;
     offerId: string;
-    awaitingConnection: boolean;
+    signalPublished: boolean;
     timer?: ReturnType<typeof setTimeout>;
 }
 
@@ -109,7 +112,7 @@ export interface DebugEvent {
 
 export interface NostrProviderEvents {
     status: (event: { status: "connected" | "disconnected"; relay: string }) => void;
-    peers: (peerIds: string[]) => void;
+    peers: (peerIds: readonly string[]) => void;
     synced: (synced: boolean) => void;
     "connection-error": (event: { error: unknown; relay?: string }) => void;
     "peer-error": (error: unknown) => void;
@@ -117,63 +120,31 @@ export interface NostrProviderEvents {
     debug: (event: DebugEvent) => void;
 }
 
-const readMessage = (
-    provider: NostrProvider,
-    peer: WebrtcDataPeer,
-    peerId: PeerId,
-    data: ArrayBuffer,
-    sendProtocolMessage: (message: Uint8Array<ArrayBuffer>) => boolean,
-): boolean => {
-    const decoder = decoding.createDecoder(new Uint8Array(data));
-    const encoder = encoding.createEncoder();
-    const messageType = decoding.readVarUint(decoder);
-
-    if (messageType === messageSync) {
-        encoding.writeVarUint(encoder, messageSync);
-        const syncType = syncProtocol.readSyncMessage(decoder, encoder, provider.doc, peer);
-        if (encoding.length(encoder) > 1 && !sendProtocolMessage(encoding.toUint8Array(encoder))) {
-            return false;
-        }
-        return syncType === syncProtocol.messageYjsSyncStep2;
-    } else if (messageType === messageAwareness) {
-        awarenessProtocol.applyAwarenessUpdate(
-            provider.awareness,
-            decoding.readVarUint8Array(decoder),
-            peer,
-        );
-    } else if (messageType === messageQueryAwareness) {
-        provider.sendAwareness(peer);
-    } else if (messageType === messageDirect) {
-        provider.emit("direct-message", [peerId, decoding.readVarUint8Array(decoder)]);
-    }
-    return false;
-};
-
 export class NostrProvider extends ObservableV2<NostrProviderEvents> {
     readonly roomName: string;
     readonly doc: Y.Doc;
-    readonly relays: readonly string[];
-    readonly password: string;
-    readonly maxConns: number;
-    readonly offerTimeout: number;
-    readonly signalTimeout: number;
-    readonly relayConnectTimeout: number;
-    readonly fallbackMaxMessageSize: number;
-    readonly maxBufferedAmount: number;
-    readonly rtcConfig: RTCConfiguration;
-    readonly channelName: string;
-    readonly identity: NostrIdentity;
+    private readonly relays: readonly string[];
+    private readonly password: string;
+    private readonly maxConns: number;
+    private readonly offerTimeout: number;
+    private readonly signalTimeout: number;
+    private readonly relayConnectTimeout: number;
+    private readonly fallbackMaxMessageSize: number;
+    private readonly maxBufferedAmount: number;
+    private readonly rtcConfig: RTCConfiguration;
+    private readonly channelName: string;
+    private readonly identity: NostrIdentity;
     readonly peerId: PeerId;
-    readonly debug: boolean;
+    private readonly debug: boolean;
     readonly awareness: Awareness;
     readonly ready: Promise<void>;
-    shouldConnect = true;
-    synced = false;
-    roomTopic: string | null = null;
-    peerTopic: string | null = null;
-    relayConnections: NostrRelay[] = [];
-    peers: Map<PeerId, WebrtcDataPeer> = new Map();
-    pendingPeers: Map<PeerId, PendingPeer> = new Map();
+    private shouldConnect = true;
+    private _synced = false;
+    private roomTopic: string | null = null;
+    private peerTopic: string | null = null;
+    private relayConnections: NostrRelay[] = [];
+    private readonly peers: Map<PeerId, WebrtcDataPeer> = new Map();
+    private readonly pendingPeers: Map<PeerId, PendingPeer> = new Map();
     private encryptionKey: CryptoKey | null = null;
     private readonly _WebSocket: typeof WebSocket | undefined;
     private readonly _RTCPeerConnection: typeof RTCPeerConnection | undefined;
@@ -232,6 +203,14 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         this.ready = this.connect();
     }
 
+    get synced(): boolean {
+        return this._synced;
+    }
+
+    get peerIds(): readonly PeerId[] {
+        return Array.from(this.peers.keys());
+    }
+
     connect(): Promise<void> {
         if (this.destroyed) return Promise.resolve();
         if (this.connectionPromise) return this.connectionPromise;
@@ -256,7 +235,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
     private async initializeConnection(generation: number): Promise<void> {
         const { roomTopic, encryptionKey } = await deriveRoomSecrets(this.roomName, this.password);
         const peerTopic = await createPeerTopic(roomTopic, this.peerId);
-        if (!this.isCurrentGeneration(generation)) return;
+        if (!this.isActive() || !this.isCurrentGeneration(generation)) return;
         this.roomTopic = roomTopic;
         this.peerTopic = peerTopic;
         this.encryptionKey = encryptionKey;
@@ -270,23 +249,25 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         );
 
         for (const url of this.relays) {
-            if (!this.isCurrentGeneration(generation)) break;
+            if (!this.isActive() || !this.isCurrentGeneration(generation)) break;
             try {
                 const relay = new NostrRelay(url, {
                     topics: [roomTopic, peerTopic],
                     onEvent: (event, relay) => {
                         void this.receiveEvent(event, relay, generation).catch((error: unknown) => {
-                            if (this.isCurrentGeneration(generation)) {
+                            if (this.isActive() && this.isCurrentGeneration(generation)) {
                                 this.emit("connection-error", [{ error, relay: relay.url }]);
                             }
                         });
                     },
                     onOpen: (relay, reconnected) => {
-                        if (!this.isCurrentGeneration(generation)) return;
+                        if (!this.isActive() || !this.isCurrentGeneration(generation)) return;
                         const publication = reconnected
                             ? this.announce(relay)
                             : initialAnnouncement.then((event) => {
-                                  if (!this.isCurrentGeneration(generation)) return false;
+                                  if (!this.isActive() || !this.isCurrentGeneration(generation)) {
+                                      return false;
+                                  }
                                   if (Math.floor(Date.now() / 1000) - event.created_at > 90) {
                                       return this.announce(relay);
                                   }
@@ -300,6 +281,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
                             })
                             .finally(() => {
                                 if (
+                                    this.isActive() &&
                                     this.recoveryStartPending &&
                                     this.openRelays.size > 0 &&
                                     this.isCurrentGeneration(generation)
@@ -310,7 +292,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
                             });
                     },
                     onStatus: (status, relay) => {
-                        if (!this.isCurrentGeneration(generation)) return;
+                        if (!this.isActive() || !this.isCurrentGeneration(generation)) return;
                         if (status === "connected") {
                             if (this.openRelays.size === 0) this.recoveryStartPending = true;
                             this.openRelays.add(relay);
@@ -324,7 +306,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
                         this.emit("status", [{ status, relay: relay.url }]);
                     },
                     onError: (error, relay) => {
-                        if (this.isCurrentGeneration(generation)) {
+                        if (this.isActive() && this.isCurrentGeneration(generation)) {
                             this.emit("connection-error", [{ error, relay: relay.url }]);
                         }
                     },
@@ -338,8 +320,8 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         }
     }
 
-    async announce(relay?: NostrRelay): Promise<boolean> {
-        if (!this.shouldConnect || !this.roomTopic) return false;
+    private async announce(relay?: NostrRelay): Promise<boolean> {
+        if (!this.isActive() || !this.roomTopic) return false;
         return this.publishPayload(
             this.roomTopic,
             { v: protocolVersion, type: "announce" },
@@ -347,12 +329,12 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         );
     }
 
-    async receiveEvent(
+    private async receiveEvent(
         event: NostrEvent,
         relay: NostrRelay,
         generation: number = this.connectionGeneration,
     ): Promise<void> {
-        if (!this.isCurrentGeneration(generation)) return;
+        if (!this.isActive() || !this.isCurrentGeneration(generation)) return;
         if (event.pubkey === this.peerId || this.hasSeenEvent(event.id)) return;
         if (Math.abs(Math.floor(Date.now() / 1000) - event.created_at) > 120) return;
         if (!hasValidSignalExpiration(event)) return;
@@ -368,7 +350,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
             this.emitDebug({ type: "signal-decrypt-failed", relay: relay.url });
             return;
         }
-        if (!this.isCurrentGeneration(generation)) return;
+        if (!this.isActive() || !this.isCurrentGeneration(generation)) return;
         if (!isSignalPayload(payload) || payload.v !== protocolVersion) return;
         if (payload.from !== event.pubkey || payload.topic !== eventTopic) return;
         if (!this.hasValidRouting(payload, eventTopic)) return;
@@ -383,18 +365,23 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         }
     }
 
-    async receiveAnnounce(
+    private async receiveAnnounce(
         peerId: PeerId,
         relay: NostrRelay,
         isResponse: boolean = false,
     ): Promise<void> {
-        if (!this.shouldConnect || this.destroyed) return;
-        const generation = this.connectionGeneration;
-        if (this.peers.has(peerId) || this.pendingPeers.has(peerId) || !this.hasCapacity()) {
+        if (!this.isActive()) return;
+        const role = this.negotiationRole(peerId);
+        if (
+            role === "self" ||
+            this.peers.has(peerId) ||
+            this.pendingPeers.has(peerId) ||
+            !this.hasCapacity()
+        ) {
             return;
         }
 
-        if (this.peerId > peerId) {
+        if (role === "answering") {
             if (!isResponse) {
                 const topic = await createPeerTopic(this.roomTopic!, peerId);
                 await this.publishPayload(
@@ -406,37 +393,69 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
             return;
         }
 
+        const offerId = createOfferId();
+        await this.negotiatePeer(peerId, relay, role, offerId, (peer) => peer.createOffer());
+    }
+
+    private async receiveOffer(
+        peerId: PeerId,
+        offerId: string,
+        signal: RTCSessionDescriptionInit,
+        relay: NostrRelay,
+    ): Promise<void> {
+        if (!this.isActive()) return;
+        const role = this.negotiationRole(peerId);
+        if (
+            role !== "answering" ||
+            this.peers.has(peerId) ||
+            this.pendingPeers.has(peerId) ||
+            !this.hasCapacity()
+        ) {
+            return;
+        }
+
+        await this.negotiatePeer(peerId, relay, role, offerId, (peer) => peer.acceptOffer(signal));
+    }
+
+    private async negotiatePeer(
+        peerId: PeerId,
+        relay: NostrRelay,
+        role: PeerRole,
+        offerId: string,
+        createSignal: (peer: WebrtcDataPeer) => Promise<RTCSessionDescriptionInit>,
+    ): Promise<void> {
+        const generation = this.connectionGeneration;
         this.pauseAnnouncementRetry();
         let peer: WebrtcDataPeer;
         try {
-            peer = this.createPeer(peerId, true);
+            peer = this.createPeer(peerId, role === "offering");
         } catch (error) {
             this.emit("peer-error", [error]);
-            this.resumeAnnouncementRetry();
+            this.ensureAnnouncementRecovery();
             return;
         }
-        const offerId = createOfferId();
-        this.pendingPeers.set(peerId, {
+        const pending: PendingPeer = {
             peer,
             relay,
-            role: "offering",
+            role,
             offerId,
-            awaitingConnection: false,
-        });
+            signalPublished: false,
+        };
+        this.pendingPeers.set(peerId, pending);
 
         try {
-            const signal = await peer.createOffer();
-            const pending = this.pendingPeers.get(peerId);
-            if (!pending || pending.peer !== peer) {
-                this.resumeAnnouncementRetry();
+            const signal = await createSignal(peer);
+            if (this.pendingPeers.get(peerId) !== pending) {
+                this.ensureAnnouncementRecovery();
                 return;
             }
             const topic = await createPeerTopic(this.roomTopic!, peerId);
+            const signalType = role === "offering" ? "offer" : "answer";
             const published = await this.publishPayload(
                 topic,
                 {
                     v: protocolVersion,
-                    type: "offer",
+                    type: signalType,
                     to: peerId,
                     offerId,
                     signal,
@@ -445,7 +464,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
             );
             if (!published) {
                 peer.destroy();
-                this.resumeAnnouncementRetry();
+                this.ensureAnnouncementRecovery();
                 return;
             }
             if (this.pendingPeers.get(peerId) !== pending) {
@@ -453,107 +472,34 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
                 return;
             }
             this.cancelAnnouncementRetry();
-            pending.awaitingConnection = true;
+            pending.signalPublished = true;
             this.startSignalTimeout(peerId, pending);
-            this.emitDebug({ type: "offer-sent", peerId, offerId, relay: relay.url });
+            this.emitDebug({
+                type: role === "offering" ? "offer-sent" : "answer-sent",
+                peerId,
+                offerId,
+                relay: relay.url,
+            });
         } catch (error) {
             if (
+                !this.isActive() ||
                 !this.isCurrentGeneration(generation) ||
-                this.pendingPeers.get(peerId)?.peer !== peer
+                this.pendingPeers.get(peerId) !== pending
             ) {
                 return;
             }
             this.emit("peer-error", [error]);
             peer.destroy();
-            this.resumeAnnouncementRetry();
+            this.ensureAnnouncementRecovery();
         }
     }
 
-    async receiveOffer(
-        peerId: PeerId,
-        offerId: string,
-        signal: RTCSessionDescriptionInit,
-        relay: NostrRelay,
-    ): Promise<void> {
-        if (!this.shouldConnect || this.destroyed) return;
-        const generation = this.connectionGeneration;
-        if (
-            peerId >= this.peerId ||
-            this.peers.has(peerId) ||
-            this.pendingPeers.has(peerId) ||
-            !this.hasCapacity()
-        ) {
-            return;
-        }
-
-        this.pauseAnnouncementRetry();
-        let peer: WebrtcDataPeer;
-        try {
-            peer = this.createPeer(peerId, false);
-        } catch (error) {
-            this.emit("peer-error", [error]);
-            this.resumeAnnouncementRetry();
-            return;
-        }
-        const pending: PendingPeer = {
-            peer,
-            relay,
-            role: "answering",
-            offerId,
-            awaitingConnection: false,
-        };
-        this.pendingPeers.set(peerId, pending);
-
-        try {
-            const answer = await peer.acceptOffer(signal);
-            if (this.pendingPeers.get(peerId)?.peer !== peer) {
-                this.resumeAnnouncementRetry();
-                return;
-            }
-            const topic = await createPeerTopic(this.roomTopic!, peerId);
-            const published = await this.publishPayload(
-                topic,
-                {
-                    v: protocolVersion,
-                    type: "answer",
-                    to: peerId,
-                    offerId,
-                    signal: answer,
-                },
-                [relay],
-            );
-            if (!published) {
-                peer.destroy();
-                this.resumeAnnouncementRetry();
-                return;
-            }
-            if (this.pendingPeers.get(peerId) !== pending) {
-                this.startAnnouncementRecoveryEpisode();
-                return;
-            }
-            this.cancelAnnouncementRetry();
-            pending.awaitingConnection = true;
-            this.startSignalTimeout(peerId, pending);
-            this.emitDebug({ type: "answer-sent", peerId, offerId, relay: relay.url });
-        } catch (error) {
-            if (
-                !this.isCurrentGeneration(generation) ||
-                this.pendingPeers.get(peerId)?.peer !== peer
-            ) {
-                return;
-            }
-            this.emit("peer-error", [error]);
-            peer.destroy();
-            this.resumeAnnouncementRetry();
-        }
-    }
-
-    async receiveAnswer(
+    private async receiveAnswer(
         peerId: PeerId,
         offerId: string,
         signal: RTCSessionDescriptionInit,
     ): Promise<void> {
-        if (!this.shouldConnect || this.destroyed) return;
+        if (!this.isActive()) return;
         const generation = this.connectionGeneration;
         const pending = this.pendingPeers.get(peerId);
         if (!pending || pending.role !== "offering" || pending.offerId !== offerId) return;
@@ -561,6 +507,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
             await pending.peer.acceptAnswer(signal);
         } catch (error) {
             if (
+                !this.isActive() ||
                 !this.isCurrentGeneration(generation) ||
                 this.pendingPeers.get(peerId) !== pending
             ) {
@@ -571,7 +518,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         }
     }
 
-    createPeer(remotePeerId: PeerId, initiator: boolean): WebrtcDataPeer {
+    private createPeer(remotePeerId: PeerId, initiator: boolean): WebrtcDataPeer {
         const generation = this.connectionGeneration;
         const peer = new WebrtcDataPeer({
             initiator,
@@ -585,7 +532,9 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
             onMessage: (peer, data) => this.onPeerMessage(peer, remotePeerId, data, generation),
             onClose: (peer) => this.removePeer(peer, remotePeerId, generation),
             onError: (_peer, error) => {
-                if (this.isCurrentGeneration(generation)) this.emit("peer-error", [error]);
+                if (this.isActive() && this.isCurrentGeneration(generation)) {
+                    this.emit("peer-error", [error]);
+                }
             },
             onDebug: (event) => this.emitDebug({ type: String(event["type"]), ...event }),
         });
@@ -593,13 +542,13 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         return peer;
     }
 
-    onPeerOpen(
+    private onPeerOpen(
         peer: WebrtcDataPeer,
         peerId: PeerId,
         initiator: boolean,
         generation: number = this.connectionGeneration,
     ): void {
-        if (!this.isCurrentGeneration(generation)) {
+        if (!this.isActive() || !this.isCurrentGeneration(generation)) {
             peer.destroy();
             return;
         }
@@ -617,23 +566,19 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         this.cancelAnnouncementRetry();
         this.emitDebug({ type: "peer-connect", peerId, initiator });
         if (!this.sendSyncStep1(peer) || !this.sendAwareness(peer)) return;
-        this.emit("peers", [Array.from(this.peers.keys())]);
+        this.emit("peers", [this.peerIds]);
     }
 
-    onPeerMessage(
+    private onPeerMessage(
         peer: WebrtcDataPeer,
         peerId: PeerId,
         data: ArrayBuffer,
         generation: number = this.connectionGeneration,
     ): void {
-        if (!this.isCurrentGeneration(generation)) return;
+        if (!this.isActive() || !this.isCurrentGeneration(generation)) return;
         if (this.peers.get(peerId) !== peer || !peer.connected) return;
         try {
-            if (
-                readMessage(this, peer, peerId, data, (message) =>
-                    this.sendProtocolMessage(peer, message),
-                )
-            ) {
+            if (this.readPeerMessage(peer, peerId, data) === "sync-step-2") {
                 this.syncedPeers.add(peer);
                 this.updateSyncedState();
             }
@@ -643,12 +588,46 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         }
     }
 
-    removePeer(
+    private readPeerMessage(
+        peer: WebrtcDataPeer,
+        peerId: PeerId,
+        data: ArrayBuffer,
+    ): PeerMessageResult {
+        const decoder = decoding.createDecoder(new Uint8Array(data));
+        const encoder = encoding.createEncoder();
+        const messageType = decoding.readVarUint(decoder);
+
+        if (messageType === messageSync) {
+            encoding.writeVarUint(encoder, messageSync);
+            const syncType = syncProtocol.readSyncMessage(decoder, encoder, this.doc, peer);
+            if (
+                encoding.length(encoder) > 1 &&
+                !this.sendProtocolMessage(peer, encoding.toUint8Array(encoder))
+            ) {
+                return "handled";
+            }
+            return syncType === syncProtocol.messageYjsSyncStep2 ? "sync-step-2" : "handled";
+        }
+        if (messageType === messageAwareness) {
+            awarenessProtocol.applyAwarenessUpdate(
+                this.awareness,
+                decoding.readVarUint8Array(decoder),
+                peer,
+            );
+        } else if (messageType === messageQueryAwareness) {
+            this.sendAwareness(peer);
+        } else if (messageType === messageDirect) {
+            this.emit("direct-message", [peerId, decoding.readVarUint8Array(decoder)]);
+        }
+        return "handled";
+    }
+
+    private removePeer(
         peer: WebrtcDataPeer,
         peerId: PeerId,
         generation: number = this.connectionGeneration,
     ): void {
-        if (generation !== this.connectionGeneration) return;
+        if (!this.isCurrentGeneration(generation)) return;
         let changed = false;
         let shouldRecover = false;
         this.syncedPeers.delete(peer);
@@ -662,10 +641,10 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
             if (pending?.peer === peer) {
                 clearTimeout(pending.timer);
                 this.pendingPeers.delete(peerId);
-                shouldRecover = pending.awaitingConnection;
+                shouldRecover = pending.signalPublished;
             }
         }
-        if (changed) this.emit("peers", [Array.from(this.peers.keys())]);
+        if (changed) this.emit("peers", [this.peerIds]);
         if (changed || shouldRecover) this.startAnnouncementRecoveryEpisode();
     }
 
@@ -679,14 +658,14 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         return false;
     }
 
-    sendSyncStep1(peer: WebrtcDataPeer): boolean {
+    private sendSyncStep1(peer: WebrtcDataPeer): boolean {
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, messageSync);
         syncProtocol.writeSyncStep1(encoder, this.doc);
         return this.sendProtocolMessage(peer, encoding.toUint8Array(encoder));
     }
 
-    sendAwareness(peer: WebrtcDataPeer): boolean {
+    private sendAwareness(peer: WebrtcDataPeer): boolean {
         const states = Array.from(this.awareness.getStates().keys());
         if (states.length === 0) return true;
         const encoder = encoding.createEncoder();
@@ -698,14 +677,14 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         return this.sendProtocolMessage(peer, encoding.toUint8Array(encoder));
     }
 
-    broadcastSyncUpdate(update: Uint8Array): void {
+    private broadcastSyncUpdate(update: Uint8Array): void {
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, messageSync);
         syncProtocol.writeUpdate(encoder, update);
         this.broadcast(encoding.toUint8Array(encoder));
     }
 
-    broadcastAwareness(update: Uint8Array): void {
+    private broadcastAwareness(update: Uint8Array): void {
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, messageAwareness);
         encoding.writeVarUint8Array(encoder, update);
@@ -726,13 +705,13 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         }
     }
 
-    broadcast(message: Uint8Array<ArrayBuffer>): void {
+    private broadcast(message: Uint8Array<ArrayBuffer>): void {
         for (const peer of this.peers.values()) {
             if (peer.connected) this.sendProtocolMessage(peer, message);
         }
     }
 
-    emitDebug(event: DebugEvent): void {
+    private emitDebug(event: DebugEvent): void {
         if (this.debug) this.emit("debug", [event]);
     }
 
@@ -757,8 +736,8 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         this.peers.clear();
         this.pendingPeers.clear();
         this.syncedPeers.clear();
-        if (this.synced) {
-            this.synced = false;
+        if (this._synced) {
+            this._synced = false;
             this.emit("synced", [false]);
         }
         if (localAwarenessState !== null) this.awareness.setLocalState(localAwarenessState);
@@ -777,8 +756,17 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         super.destroy();
     }
 
+    private isActive(): boolean {
+        return !this.destroyed && this.shouldConnect;
+    }
+
     private isCurrentGeneration(generation: number): boolean {
-        return !this.destroyed && this.shouldConnect && generation === this.connectionGeneration;
+        return generation === this.connectionGeneration;
+    }
+
+    private negotiationRole(peerId: PeerId): NegotiationRole {
+        if (peerId === this.peerId) return "self";
+        return this.peerId < peerId ? "offering" : "answering";
     }
 
     private hasValidRouting(payload: SignalPayload, eventTopic: string): boolean {
@@ -794,8 +782,8 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
 
     private updateSyncedState(): void {
         const synced = this.syncedPeers.size > 0;
-        if (synced === this.synced) return;
-        this.synced = synced;
+        if (synced === this._synced) return;
+        this._synced = synced;
         this.emit("synced", [synced]);
     }
 
@@ -809,7 +797,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
     }
 
     private scheduleAnnouncementRetry(): void {
-        if (!this.shouldConnect || this.destroyed || this.announcementRetry) return;
+        if (!this.isActive() || this.announcementRetry) return;
         this.announcementRetry = {
             attempt: 0,
             generation: this.connectionGeneration,
@@ -823,6 +811,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
     ): void {
         if (
             this.announcementRetry !== state ||
+            !this.isActive() ||
             !this.isCurrentGeneration(state.generation) ||
             state.paused ||
             state.timer ||
@@ -834,7 +823,11 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         state.timer = setTimeout(() => {
             delete state.timer;
             state.attempt++;
-            if (this.announcementRetry !== state || !this.isCurrentGeneration(state.generation)) {
+            if (
+                this.announcementRetry !== state ||
+                !this.isActive() ||
+                !this.isCurrentGeneration(state.generation)
+            ) {
                 return;
             }
             void this.announce().finally(() => this.scheduleNextAnnouncementRetry(state));
@@ -848,7 +841,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         delete this.announcementRetry.timer;
     }
 
-    private resumeAnnouncementRetry(): void {
+    private ensureAnnouncementRecovery(): void {
         if (!this.announcementRetry) {
             this.startAnnouncementRecoveryEpisode();
             return;
@@ -894,11 +887,11 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         payload: OutgoingSignalPayload,
         relays: readonly NostrRelay[] = this.relayConnections,
     ): Promise<boolean> {
-        if (!this.shouldConnect) return false;
+        if (!this.isActive()) return false;
         const generation = this.connectionGeneration;
         try {
             const event = await this.createPayloadEvent(topic, payload);
-            if (!this.isCurrentGeneration(generation)) return false;
+            if (!this.isActive() || !this.isCurrentGeneration(generation)) return false;
             const hadOpenRelay = relays.some((relay) => relay.isOpen());
             let published = false;
             for (const relay of relays) published = relay.publish(event) || published;

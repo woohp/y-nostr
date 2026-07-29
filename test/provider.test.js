@@ -4,6 +4,7 @@ import * as Y from "yjs";
 import { Awareness } from "y-protocols/awareness";
 import * as syncProtocol from "y-protocols/sync";
 import * as encoding from "lib0/encoding";
+import { createWebSocketHarness } from "../test-support/websocket.js";
 
 class FakeDataChannel {
     binaryType = "blob";
@@ -71,61 +72,6 @@ class SelectiveWebSocket {
     close() {}
 }
 
-class RecoveryWebSocket {
-    static OPEN = 1;
-    static sockets = [];
-    readyState = 0;
-    listeners = new Map();
-    sent = [];
-
-    constructor(url) {
-        this.url = url;
-        RecoveryWebSocket.sockets.push(this);
-    }
-
-    addEventListener(type, listener) {
-        const listeners = this.listeners.get(type) ?? [];
-        listeners.push(listener);
-        this.listeners.set(type, listeners);
-    }
-
-    dispatch(type, event = {}) {
-        for (const listener of this.listeners.get(type) ?? []) listener(event);
-    }
-
-    send(data) {
-        this.sent.push(JSON.parse(data));
-    }
-
-    open() {
-        this.readyState = RecoveryWebSocket.OPEN;
-        this.dispatch("open");
-    }
-
-    close() {
-        this.readyState = 3;
-        this.dispatch("close");
-    }
-}
-
-class ThrowingPublishWebSocket extends RecoveryWebSocket {
-    send(data) {
-        if (JSON.parse(data)[0] === "EVENT") throw new Error("publish failed");
-        super.send(data);
-    }
-}
-
-class TransientPublishWebSocket extends RecoveryWebSocket {
-    eventAttempts = 0;
-
-    send(data) {
-        if (JSON.parse(data)[0] === "EVENT" && ++this.eventAttempts === 1) {
-            throw new Error("transient publish failure");
-        }
-        super.send(data);
-    }
-}
-
 globalThis.RTCPeerConnection = FakePeerConnection;
 
 const { NostrProvider, createEvent, createIdentity, defaultRtcConfig } =
@@ -144,8 +90,35 @@ function createProvider(keyValue) {
     });
 }
 
-test("uses public STUN servers by default and allows rtcConfig overrides", async () => {
+test("rejects self-signaling before peer negotiation", async (context) => {
+    const provider = createProvider(40);
+    context.after(() => provider.destroy());
+    await provider.ready;
+    let publications = 0;
+    const relay = {
+        url: "wss://relay.test",
+        isOpen: () => true,
+        publish: () => {
+            publications++;
+            return true;
+        },
+    };
+
+    await provider.receiveAnnounce(provider.peerId, relay);
+    await provider.receiveOffer(
+        provider.peerId,
+        "self-offer",
+        { type: "offer", sdp: "self" },
+        relay,
+    );
+
+    assert.equal(provider.pendingPeers.size, 0);
+    assert.equal(publications, 0);
+});
+
+test("uses public STUN servers by default and allows rtcConfig overrides", async (context) => {
     const provider = createProvider(1);
+    context.after(() => provider.destroy());
     await provider.ready;
     assert.equal(provider.rtcConfig, defaultRtcConfig);
     assert.deepEqual(provider.rtcConfig.iceServers, [
@@ -159,15 +132,14 @@ test("uses public STUN servers by default and allows rtcConfig overrides", async
         relays: [],
         rtcConfig,
     });
+    context.after(() => overridden.destroy());
     await overridden.ready;
     assert.equal(overridden.rtcConfig, rtcConfig);
-
-    provider.destroy();
-    overridden.destroy();
 });
 
-test("sendToPeer sends a directed binary message to only the selected peer", async () => {
+test("sendToPeer sends a directed binary message to only the selected peer", async (context) => {
     const sender = createProvider(3);
+    context.after(() => sender.destroy());
     await sender.ready;
     const sent = [];
     sender.peers.set("recipient", {
@@ -190,6 +162,7 @@ test("sendToPeer sends a directed binary message to only the selected peer", asy
     assert.equal(sent.length, 1);
 
     const recipient = createProvider(4);
+    context.after(() => recipient.destroy());
     await recipient.ready;
     const peer = recipient.createPeer(sender.peerId, true);
     peer.channel.markOpen();
@@ -203,14 +176,15 @@ test("sendToPeer sends a directed binary message to only the selected peer", asy
         peerId: sender.peerId,
         payload: new Uint8Array([1, 2, 3]),
     });
-
-    sender.destroy();
-    recipient.destroy();
 });
 
-test("only the deterministically selected peer creates an offer", async () => {
+test("only the deterministically selected peer creates an offer", async (context) => {
     const first = createProvider(6);
     const second = createProvider(7);
+    context.after(() => {
+        first.destroy();
+        second.destroy();
+    });
     await Promise.all([first.ready, second.ready]);
     const [lower, higher] = [first, second].sort((a, b) => a.peerId.localeCompare(b.peerId));
 
@@ -220,14 +194,15 @@ test("only the deterministically selected peer creates an offer", async () => {
 
     assert.equal(lower.pendingPeers.get(higher.peerId)?.role, "offering");
     assert.equal(higher.pendingPeers.has(lower.peerId), false);
-
-    first.destroy();
-    second.destroy();
 });
 
-test("completes event-driven encrypted offer and answer signaling", async () => {
+test("completes event-driven encrypted offer and answer signaling", async (context) => {
     const first = createProvider(8);
     const second = createProvider(9);
+    context.after(() => {
+        first.destroy();
+        second.destroy();
+    });
     await Promise.all([first.ready, second.ready]);
     const [lower, higher] = [first, second].sort((a, b) => a.peerId.localeCompare(b.peerId));
     const participants = [lower, higher];
@@ -249,13 +224,11 @@ test("completes event-driven encrypted offer and answer signaling", async () => 
     assert.equal(higher.pendingPeers.get(lower.peerId)?.role, "answering");
     assert.equal(lower.pendingPeers.get(higher.peerId)?.peer.pc.remoteDescription.type, "answer");
     assert.equal(higher.pendingPeers.get(lower.peerId)?.peer.pc.remoteDescription.type, "offer");
-
-    first.destroy();
-    second.destroy();
 });
 
-test("sendToPeer returns false for missing and disconnected peers", async () => {
+test("sendToPeer returns false for missing and disconnected peers", async (context) => {
     const provider = createProvider(5);
+    context.after(() => provider.destroy());
     await provider.ready;
     provider.peers.set("disconnected", {
         connected: false,
@@ -265,15 +238,14 @@ test("sendToPeer returns false for missing and disconnected peers", async () => 
 
     assert.equal(provider.sendToPeer("missing", new Uint8Array()), false);
     assert.equal(provider.sendToPeer("disconnected", new Uint8Array()), false);
-
-    provider.destroy();
 });
-test("keeps valid relays when another relay constructor throws", async () => {
+test("keeps valid relays when another relay constructor throws", async (context) => {
     const provider = new NostrProvider("test-room", new Y.Doc(), {
         privateKey: privateKey(17),
         relays: ["invalid://relay", "wss://valid.test"],
         WebSocket: SelectiveWebSocket,
     });
+    context.after(() => provider.destroy());
     const error = new Promise((resolve) => provider.on("connection-error", resolve));
 
     await provider.ready;
@@ -281,12 +253,15 @@ test("keeps valid relays when another relay constructor throws", async () => {
     assert.match(String((await error).error), /Invalid relay URL/);
     assert.equal(provider.relayConnections.length, 1);
     assert.equal(provider.relayConnections[0].url, "wss://valid.test");
-    provider.destroy();
 });
 
-test("rejects signaling ciphertext re-signed by another identity or moved to another topic", async () => {
+test("rejects signaling ciphertext re-signed by another identity or moved to another topic", async (context) => {
     const sender = createProvider(10);
     const receiver = createProvider(11);
+    context.after(() => {
+        sender.destroy();
+        receiver.destroy();
+    });
     await Promise.all([sender.ready, receiver.ready]);
     const relay = { url: "wss://relay.test", isOpen: () => true, publish: () => true };
     let announcements = 0;
@@ -313,13 +288,11 @@ test("rejects signaling ciphertext re-signed by another identity or moved to ano
     });
     await receiver.receiveEvent(misrouted, relay);
     assert.equal(announcements, 1);
-
-    sender.destroy();
-    receiver.destroy();
 });
 
-test("reports malformed peer frames and destroys the peer", async () => {
+test("reports malformed peer frames and destroys the peer", async (context) => {
     const provider = createProvider(13);
+    context.after(() => provider.destroy());
     await provider.ready;
     const peer = provider.createPeer("remote", true);
     peer.channel.markOpen();
@@ -330,12 +303,15 @@ test("reports malformed peer frames and destroys the peer", async () => {
 
     assert.ok((await error) instanceof Error);
     assert.equal(peer.closed, true);
-    provider.destroy();
 });
 
-test("sets synced only after Sync Step 2 and synchronizes documents", async () => {
+test("sets synced only after Sync Step 2 and synchronizes documents", async (context) => {
     const first = createProvider(14);
     const second = createProvider(15);
+    context.after(() => {
+        first.destroy();
+        second.destroy();
+    });
     await Promise.all([first.ready, second.ready]);
     first.doc.getText("text").insert(0, "hello");
 
@@ -359,12 +335,11 @@ test("sets synced only after Sync Step 2 and synchronizes documents", async () =
 
     firstPeer.destroy();
     assert.equal(first.synced, false);
-    first.destroy();
-    second.destroy();
 });
 
-test("connect shares initialization and is reusable while destroy is final", async () => {
+test("connect shares initialization and is reusable while destroy is final", async (context) => {
     const provider = createProvider(16);
+    context.after(() => provider.destroy());
     assert.equal(provider.connect(), provider.ready);
     await provider.ready;
     provider.disconnect();
@@ -406,16 +381,17 @@ test("connect can retry after key derivation fails", async (context) => {
     });
 
     const provider = createProvider(18);
+    context.after(() => provider.destroy());
     await assert.rejects(provider.ready, /KDF failed/);
     Object.defineProperty(globalThis, "crypto", { configurable: true, value: originalCrypto });
 
     await provider.connect();
     assert.equal(provider.shouldConnect, true);
-    provider.destroy();
 });
 
 test("announcement recovery is bounded, non-overlapping, and cancellable", async (context) => {
     const provider = createProvider(19);
+    context.after(() => provider.destroy());
     await provider.ready;
     context.mock.method(Math, "random", () => 0);
     context.mock.timers.enable({ apis: ["setTimeout"] });
@@ -443,9 +419,6 @@ test("announcement recovery is bounded, non-overlapping, and cancellable", async
     context.mock.timers.tick(375);
     assert.equal(announcements, 3);
     assert.equal(provider.announcementRetry, null);
-
-    provider.pendingPeers.clear();
-    provider.destroy();
 });
 test("recovery resumes when a pending peer disappears during offer creation", async (context) => {
     const provider = createProvider(21);
@@ -479,17 +452,17 @@ test("recovery resumes when a pending peer disappears during offer creation", as
     assert.ok(provider.announcementRetry.timer);
 });
 test("retries a dropped initial announcement after the first relay opens", async (context) => {
-    RecoveryWebSocket.sockets.length = 0;
+    const { WebSocket, sockets } = createWebSocketHarness();
     context.mock.method(Math, "random", () => 0);
     context.mock.timers.enable({ apis: ["setTimeout"] });
     const provider = new NostrProvider("recovery-room", new Y.Doc(), {
         privateKey: privateKey(22),
         relays: ["wss://relay.test"],
-        WebSocket: RecoveryWebSocket,
+        WebSocket,
     });
     context.after(() => provider.destroy());
     await provider.ready;
-    const socket = RecoveryWebSocket.sockets[0];
+    const socket = sockets[0];
 
     socket.open();
     const eventCount = () => socket.sent.filter((message) => message[0] === "EVENT").length;
@@ -501,8 +474,9 @@ test("retries a dropped initial announcement after the first relay opens", async
     assert.equal(eventCount(), 2);
 });
 
-test("protocol send failures destroy only the failed peer", async () => {
+test("protocol send failures destroy only the failed peer", async (context) => {
     const provider = createProvider(23);
+    context.after(() => provider.destroy());
     await provider.ready;
     let initialSends = 0;
     let initialDestroyed = 0;
@@ -551,7 +525,6 @@ test("protocol send failures destroy only the failed peer", async () => {
     assert.equal(provider.peers.has("failed-peer"), false);
     assert.equal(healthySends, 1);
     assert.equal(provider.peers.has("healthy-peer"), true);
-    provider.destroy();
 });
 
 test("repeated offer failures preserve the global retry budget", async (context) => {
@@ -583,7 +556,6 @@ test("repeated offer failures preserve the global retry budget", async (context)
 
     assert.equal(announcements, 3);
     assert.equal(provider.announcementRetry.attempt, 3);
-    provider.destroy();
 });
 test("protocol send failure starts bounded peer-loss recovery", async (context) => {
     const provider = createProvider(24);
@@ -647,7 +619,7 @@ test("failed pending connection starts recovery before signal timeout", async (c
         relay,
         role: "offering",
         offerId: "offer-id",
-        awaitingConnection: true,
+        signalPublished: true,
     });
 
     await provider.receiveAnswer(peerId, "offer-id", { type: "answer", sdp: "failed" });
@@ -656,8 +628,9 @@ test("failed pending connection starts recovery before signal timeout", async (c
     assert.ok(provider.announcementRetry?.timer);
 });
 
-test("owned awareness removal is sent before provider teardown", async () => {
+test("owned awareness removal is sent before provider teardown", async (context) => {
     const provider = createProvider(26);
+    context.after(() => provider.destroy());
     await provider.ready;
     provider.awareness.setLocalState({ user: "local" });
     const sent = [];
@@ -677,24 +650,25 @@ test("owned awareness removal is sent before provider teardown", async () => {
     assert.equal(provider.awareness.getLocalState(), null);
 });
 
-test("passes send safeguards to the WebRTC transport", async () => {
+test("passes send safeguards to the WebRTC transport", async (context) => {
     const provider = new NostrProvider("limits-room", new Y.Doc(), {
         privateKey: privateKey(27),
         relays: [],
         fallbackMaxMessageSize: 123,
         maxBufferedAmount: 456,
     });
+    context.after(() => provider.destroy());
     await provider.ready;
     const peer = provider.createPeer("transport-peer", true);
+    context.after(() => peer.destroy());
 
     assert.equal(peer.fallbackMaxMessageSize, 123);
     assert.equal(peer.maxBufferedAmount, 456);
-    peer.destroy();
-    provider.destroy();
 });
 
-test("disconnect broadcasts owned awareness removal and restores local state", async () => {
+test("disconnect broadcasts owned awareness removal and restores local state", async (context) => {
     const provider = createProvider(29);
+    context.after(() => provider.destroy());
     await provider.ready;
     const localState = { user: "local" };
     provider.awareness.setLocalState(localState);
@@ -712,11 +686,11 @@ test("disconnect broadcasts owned awareness removal and restores local state", a
 
     assert.equal(sent.length, 1);
     assert.deepEqual(provider.awareness.getLocalState(), localState);
-    provider.destroy();
 });
 
-test("signaling publication failures emit connection-error, not peer-error", async () => {
+test("signaling publication failures emit connection-error, not peer-error", async (context) => {
     const provider = createProvider(30);
+    context.after(() => provider.destroy());
     await provider.ready;
     const connectionErrors = [];
     const peerErrors = [];
@@ -731,11 +705,11 @@ test("signaling publication failures emit connection-error, not peer-error", asy
 
     assert.equal(connectionErrors.length, 1);
     assert.equal(peerErrors.length, 0);
-    provider.destroy();
 });
-test("disconnect and destroy leave caller-owned awareness untouched", async () => {
+test("disconnect and destroy leave caller-owned awareness untouched", async (context) => {
     const doc = new Y.Doc();
     const awareness = new Awareness(doc);
+    context.after(() => awareness.destroy());
     const localState = { user: "external" };
     awareness.setLocalState(localState);
     const provider = new NostrProvider("external-awareness", doc, {
@@ -743,6 +717,7 @@ test("disconnect and destroy leave caller-owned awareness untouched", async () =
         relays: [],
         awareness,
     });
+    context.after(() => provider.destroy());
     await provider.ready;
 
     provider.disconnect();
@@ -753,10 +728,15 @@ test("disconnect and destroy leave caller-owned awareness untouched", async () =
     const updatedState = { user: "still usable" };
     awareness.setLocalState(updatedState);
     assert.deepEqual(awareness.getLocalState(), updatedState);
-    awareness.destroy();
 });
 test("relay send exceptions emit one connection error", async (context) => {
-    RecoveryWebSocket.sockets.length = 0;
+    const { WebSocket, sockets } = createWebSocketHarness();
+    class ThrowingPublishWebSocket extends WebSocket {
+        send(data) {
+            if (JSON.parse(data)[0] === "EVENT") throw new Error("publish failed");
+            super.send(data);
+        }
+    }
     const provider = new NostrProvider("publish-error", new Y.Doc(), {
         privateKey: privateKey(32),
         relays: ["wss://relay.test"],
@@ -767,17 +747,26 @@ test("relay send exceptions emit one connection error", async (context) => {
     provider.on("connection-error", (event) => errors.push(event));
     await provider.ready;
 
-    RecoveryWebSocket.sockets[0].open();
+    sockets[0].open();
     while (errors.length === 0) await new Promise((resolve) => setImmediate(resolve));
     assert.equal(errors.length, 1);
 
     errors.length = 0;
     await provider.announce(provider.relayConnections[0]);
     assert.equal(errors.length, 1);
-    provider.destroy();
 });
 test("transient initial publication failure starts bounded recovery", async (context) => {
-    RecoveryWebSocket.sockets.length = 0;
+    const { WebSocket, sockets } = createWebSocketHarness();
+    class TransientPublishWebSocket extends WebSocket {
+        eventAttempts = 0;
+
+        send(data) {
+            if (JSON.parse(data)[0] === "EVENT" && ++this.eventAttempts === 1) {
+                throw new Error("transient publish failure");
+            }
+            super.send(data);
+        }
+    }
     context.mock.method(Math, "random", () => 0);
     context.mock.timers.enable({ apis: ["setTimeout"] });
     const provider = new NostrProvider("transient-publication", new Y.Doc(), {
@@ -787,7 +776,7 @@ test("transient initial publication failure starts bounded recovery", async (con
     });
     context.after(() => provider.destroy());
     await provider.ready;
-    const socket = RecoveryWebSocket.sockets[0];
+    const socket = sockets[0];
 
     socket.open();
     while (!provider.announcementRetry?.timer) {
@@ -800,9 +789,13 @@ test("transient initial publication failure starts bounded recovery", async (con
     assert.equal(socket.eventAttempts, 2);
 });
 
-test("signaling requires the protocol expiration tag", async () => {
+test("signaling requires the protocol expiration tag", async (context) => {
     const sender = createProvider(34);
     const receiver = createProvider(35);
+    context.after(() => {
+        sender.destroy();
+        receiver.destroy();
+    });
     await Promise.all([sender.ready, receiver.ready]);
     const relay = { url: "wss://relay.test", isOpen: () => true, publish: () => true };
     let announcements = 0;
@@ -830,16 +823,14 @@ test("signaling requires the protocol expiration tag", async () => {
     assert.equal(announcements, 0);
     await receiver.receiveEvent(event, relay);
     assert.equal(announcements, 1);
-    sender.destroy();
-    receiver.destroy();
 });
 
 test("relay event callback reports asynchronous failures", async (context) => {
-    RecoveryWebSocket.sockets.length = 0;
+    const { WebSocket } = createWebSocketHarness();
     const provider = new NostrProvider("incoming-failure", new Y.Doc(), {
         privateKey: privateKey(36),
         relays: ["wss://relay.test"],
-        WebSocket: RecoveryWebSocket,
+        WebSocket,
     });
     context.after(() => provider.destroy());
     await provider.ready;
@@ -856,7 +847,7 @@ test("relay event callback reports asynchronous failures", async (context) => {
     assert.equal(errors[0].relay, "wss://relay.test");
 });
 
-test("disconnect cancels active ICE negotiation without peer errors or recovery", async () => {
+test("disconnect cancels active ICE negotiation without peer errors or recovery", async (context) => {
     class GatheringPeerConnection extends FakePeerConnection {
         iceGatheringState = "gathering";
     }
@@ -879,6 +870,7 @@ test("disconnect cancels active ICE negotiation without peer errors or recovery"
             offerTimeout: 1000,
             RTCPeerConnection: GatheringPeerConnection,
         });
+        context.after(() => provider.destroy());
         await provider.ready;
         const errors = [];
         provider.on("peer-error", (error) => errors.push(error));
@@ -891,11 +883,11 @@ test("disconnect cancels active ICE negotiation without peer errors or recovery"
         assert.deepEqual(errors, []);
         assert.equal(provider.pendingPeers.size, 0);
         assert.equal(provider.recoveryStartPending, false);
-        provider.destroy();
     }
 });
-test("late Sync Step 2 from a removed peer cannot restore synced", async () => {
+test("late Sync Step 2 from a removed peer cannot restore synced", async (context) => {
     const provider = createProvider(37);
+    context.after(() => provider.destroy());
     await provider.ready;
     const peerId = "removed-peer";
     const peer = { connected: true, send: () => true, destroy: () => {} };
@@ -909,5 +901,4 @@ test("late Sync Step 2 from a removed peer cannot restore synced", async () => {
 
     assert.equal(provider.synced, false);
     assert.equal(provider.syncedPeers.size, 0);
-    provider.destroy();
 });

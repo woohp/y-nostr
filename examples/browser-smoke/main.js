@@ -38,7 +38,7 @@ const renderStatus = () => {
     statusEl.textContent = [
         `room: ${roomInput.value}`,
         `relays: ${relaysInput.value}`,
-        `connected: ${provider ? provider.peers.size : 0}`,
+        `connected: ${provider ? provider.peerIds.length : 0}`,
         `peer id: ${provider ? JSON.stringify(provider.peerId) : "-"}`,
         "",
         ...logs,
