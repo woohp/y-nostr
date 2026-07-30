@@ -211,6 +211,20 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         return Array.from(this.peers.keys());
     }
 
+    sendToPeer(peerId: PeerId, message: Uint8Array<ArrayBuffer>): boolean {
+        const peer = this.peers.get(peerId);
+        if (!peer?.connected) return false;
+        const encoder = encoding.createEncoder();
+        encoding.writeVarUint(encoder, messageDirect);
+        encoding.writeVarUint8Array(encoder, message);
+        const encoded = encoding.toUint8Array(encoder);
+        try {
+            return peer.send(encoded);
+        } catch {
+            return false;
+        }
+    }
+
     connect(): Promise<void> {
         if (this.destroyed) return Promise.resolve();
         if (this.connectionPromise) return this.connectionPromise;
@@ -689,20 +703,6 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         encoding.writeVarUint(encoder, messageAwareness);
         encoding.writeVarUint8Array(encoder, update);
         this.broadcast(encoding.toUint8Array(encoder));
-    }
-
-    sendToPeer(peerId: PeerId, message: Uint8Array<ArrayBuffer>): boolean {
-        const peer = this.peers.get(peerId);
-        if (!peer?.connected) return false;
-        const encoder = encoding.createEncoder();
-        encoding.writeVarUint(encoder, messageDirect);
-        encoding.writeVarUint8Array(encoder, message);
-        const encoded = encoding.toUint8Array(encoder);
-        try {
-            return peer.send(encoded);
-        } catch {
-            return false;
-        }
     }
 
     private broadcast(message: Uint8Array<ArrayBuffer>): void {

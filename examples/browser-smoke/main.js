@@ -18,12 +18,6 @@ let ytext = null;
 let applyingRemote = false;
 const logs = [];
 
-const log = (...args) => {
-    logs.unshift(`[${new Date().toLocaleTimeString()}] ${args.map(format).join(" ")}`);
-    logs.splice(80);
-    renderStatus();
-};
-
 const format = (value) => {
     if (typeof value === "string") return value;
     if (value instanceof Error) return value.stack || value.message;
@@ -43,6 +37,25 @@ const renderStatus = () => {
         "",
         ...logs,
     ].join("\n");
+};
+
+const log = (...args) => {
+    logs.unshift(`[${new Date().toLocaleTimeString()}] ${args.map(format).join(" ")}`);
+    logs.splice(80);
+    renderStatus();
+};
+
+const disconnect = () => {
+    if (provider) provider.destroy();
+    if (doc) doc.destroy();
+    provider = null;
+    globalThis.__yNostrProvider = null;
+    doc = null;
+    ytext = null;
+    textArea.disabled = true;
+    connectButton.disabled = false;
+    disconnectButton.disabled = true;
+    renderStatus();
 };
 
 const connect = () => {
@@ -77,19 +90,6 @@ const connect = () => {
     disconnectButton.disabled = false;
     log("connecting");
     provider.ready.then(() => log("provider ready"));
-    renderStatus();
-};
-
-const disconnect = () => {
-    if (provider) provider.destroy();
-    if (doc) doc.destroy();
-    provider = null;
-    globalThis.__yNostrProvider = null;
-    doc = null;
-    ytext = null;
-    textArea.disabled = true;
-    connectButton.disabled = false;
-    disconnectButton.disabled = true;
     renderStatus();
 };
 

@@ -37,29 +37,6 @@ export const hexToBytes = (hex: string): Uint8Array => {
     return result;
 };
 
-const sha256 = async (value: string | Uint8Array): Promise<Uint8Array> =>
-    new Uint8Array(
-        await crypto.subtle.digest(
-            "SHA-256",
-            (typeof value === "string" ? textEncoder.encode(value) : value) as BufferSource,
-        ),
-    );
-
-const encodeFields = (...fields: string[]): Uint8Array => {
-    const encoded = fields.map((field) => textEncoder.encode(field));
-    const length = encoded.reduce((total, field) => total + 4 + field.length, 0);
-    const result = new Uint8Array(length);
-    const view = new DataView(result.buffer);
-    let offset = 0;
-    for (const field of encoded) {
-        view.setUint32(offset, field.length);
-        offset += 4;
-        result.set(field, offset);
-        offset += field.length;
-    }
-    return result;
-};
-
 export const passwordKdfIterations = 210000;
 
 export interface RoomSecrets {
@@ -127,9 +104,6 @@ export const createIdentity = (secretKey?: Uint8Array): NostrIdentity => {
     return { secretKey: identity.secretKey, publicKey: bytesToHex(identity.publicKey) };
 };
 
-const serializeEvent = (event: Omit<NostrEvent, "id" | "sig">): string =>
-    JSON.stringify([0, event.pubkey, event.created_at, event.kind, event.tags, event.content]);
-
 export const createEvent = async (
     topic: string,
     content: string,
@@ -186,19 +160,6 @@ export const verifyEvent = async (event: NostrEvent): Promise<boolean> => {
 export const deriveEncryptionKey = async (roomName: string, password = ""): Promise<CryptoKey> =>
     (await deriveRoomSecrets(roomName, password)).encryptionKey;
 
-const bytesToBase64 = (bytes: Uint8Array): string => {
-    let binary = "";
-    for (const byte of bytes) binary += String.fromCharCode(byte);
-    return btoa(binary);
-};
-
-const base64ToBytes = (value: string): Uint8Array => {
-    const binary = atob(value);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-};
-
 export const encrypt = async (key: CryptoKey, plaintext: string): Promise<string> => {
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const ciphertext = new Uint8Array(
@@ -219,4 +180,43 @@ export const decrypt = async (key: CryptoKey, packed: string): Promise<string> =
         bytes.subarray(12) as Uint8Array<ArrayBuffer>,
     );
     return textDecoder.decode(plaintext);
+};
+
+const sha256 = async (value: string | Uint8Array): Promise<Uint8Array> =>
+    new Uint8Array(
+        await crypto.subtle.digest(
+            "SHA-256",
+            (typeof value === "string" ? textEncoder.encode(value) : value) as BufferSource,
+        ),
+    );
+
+const encodeFields = (...fields: string[]): Uint8Array => {
+    const encoded = fields.map((field) => textEncoder.encode(field));
+    const length = encoded.reduce((total, field) => total + 4 + field.length, 0);
+    const result = new Uint8Array(length);
+    const view = new DataView(result.buffer);
+    let offset = 0;
+    for (const field of encoded) {
+        view.setUint32(offset, field.length);
+        offset += 4;
+        result.set(field, offset);
+        offset += field.length;
+    }
+    return result;
+};
+
+const serializeEvent = (event: Omit<NostrEvent, "id" | "sig">): string =>
+    JSON.stringify([0, event.pubkey, event.created_at, event.kind, event.tags, event.content]);
+
+const bytesToBase64 = (bytes: Uint8Array): string => {
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary);
+};
+
+const base64ToBytes = (value: string): Uint8Array => {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
 };
