@@ -18,6 +18,8 @@ import {
     createEvent,
     getEventTopic,
     hasValidSignalExpiration,
+    maxClockSkewSeconds,
+    staleAnnouncementSeconds,
     type NostrEvent,
 } from "./nostr-event.js";
 import { NostrRelay, defaultRelayUrls, selectDefaultRelayUrls } from "./nostr-relay.js";
@@ -281,7 +283,10 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
                                   if (!this.isActive() || !this.isCurrentGeneration(generation)) {
                                       return false;
                                   }
-                                  if (Math.floor(Date.now() / 1000) - event.created_at > 90) {
+                                  if (
+                                      Math.floor(Date.now() / 1000) - event.created_at >
+                                      staleAnnouncementSeconds
+                                  ) {
                                       return this.announce(relay);
                                   }
                                   return relay.publish(event);
@@ -338,7 +343,9 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
     ): Promise<void> {
         if (!this.isActive() || !this.isCurrentGeneration(generation)) return;
         if (event.pubkey === this.peerId || this.hasSeenEvent(event.id)) return;
-        if (Math.abs(Math.floor(Date.now() / 1000) - event.created_at) > 120) return;
+        if (Math.abs(Math.floor(Date.now() / 1000) - event.created_at) > maxClockSkewSeconds) {
+            return;
+        }
         if (!hasValidSignalExpiration(event)) return;
 
         const eventTopic = getEventTopic(event);

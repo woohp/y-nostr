@@ -4,6 +4,7 @@ import {
     isNostrEvent,
     nostrEventKind,
     nostrTopicTag,
+    subscriptionLookbackSeconds,
     verifyEvent,
     type NostrEvent,
 } from "./nostr-event.js";
@@ -180,7 +181,7 @@ export class NostrRelay {
             this.subscriptionId,
             {
                 kinds: [nostrEventKind],
-                since: Math.floor(Date.now() / 1000) - 5,
+                since: Math.floor(Date.now() / 1000) - subscriptionLookbackSeconds,
                 [`#${nostrTopicTag}`]: this.topics,
             },
         ]);

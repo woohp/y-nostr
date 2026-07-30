@@ -7,7 +7,23 @@ import { bytesToHex, hexToBytes, sha256, type NostrIdentity } from "./crypto.js"
  */
 export const nostrEventKind = 20000;
 export const nostrTopicTag = "x";
+
+/**
+ * One interlocking freshness policy, kept together because the values only make sense relative
+ * to each other.
+ *
+ * Signals expire after `signalExpirationSeconds` (NIP-40), so a receiver rejecting events more
+ * than `maxClockSkewSeconds` off its own clock must tolerate at least that much skew or it would
+ * discard signals a well-behaved peer considers live. `staleAnnouncementSeconds` is shorter than
+ * both: an announcement built before a relay opened is re-signed rather than published stale, but
+ * only if it is old enough that re-signing is cheaper than the round trip it would waste.
+ * `subscriptionLookbackSeconds` covers relay-side clock drift on the `since` filter without
+ * dredging up signals from a previous session.
+ */
 export const signalExpirationSeconds = 120;
+export const maxClockSkewSeconds = 120;
+export const staleAnnouncementSeconds = 90;
+export const subscriptionLookbackSeconds = 5;
 
 export interface NostrEvent {
     id: string;
