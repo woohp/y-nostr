@@ -8,6 +8,7 @@ import { ObservableV2 } from "lib0/observable";
 import {
     createIdentity,
     createPeerTopic,
+    randomHex,
     decrypt,
     deriveRoomSecrets,
     encrypt,
@@ -394,7 +395,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
             return;
         }
 
-        const offerId = createOfferId();
+        const offerId = randomHex(16);
         await this.negotiatePeer(peerId, relay, role, offerId, (peer) => peer.createOffer());
     }
 
@@ -844,13 +845,6 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         }
     }
 }
-
-const createOfferId = (): string => {
-    const bytes = crypto.getRandomValues(new Uint8Array(16));
-    let result = "";
-    for (const byte of bytes) result += byte.toString(16).padStart(2, "0");
-    return result;
-};
 
 const isSignalPayload = (value: unknown): value is SignalPayload => {
     if (!value || typeof value !== "object") return false;

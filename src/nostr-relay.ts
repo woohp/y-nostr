@@ -1,3 +1,4 @@
+import { randomHex } from "./crypto.js";
 import {
     getEventTopic,
     isNostrEvent,
@@ -99,7 +100,7 @@ export class NostrRelay {
         this.onError = opts.onError ?? (() => {});
         this.WebSocket = opts.WebSocket ?? globalThis.WebSocket;
         this.connectTimeout = opts.connectTimeout ?? 10000;
-        this.subscriptionId = createSubscriptionId();
+        this.subscriptionId = randomHex(8);
         this.connect();
     }
 
@@ -264,13 +265,6 @@ export class NostrRelay {
         this.socket = null;
     }
 }
-
-const createSubscriptionId = (): string => {
-    const bytes = crypto.getRandomValues(new Uint8Array(8));
-    let result = "";
-    for (const byte of bytes) result += byte.toString(16).padStart(2, "0");
-    return result;
-};
 
 const hasSubscribedTopic = (event: NostrEvent, topics: readonly string[]): boolean => {
     const topic = getEventTopic(event);

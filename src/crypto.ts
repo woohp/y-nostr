@@ -14,6 +14,10 @@ export const bytesToHex = (bytes: Uint8Array): string => {
     return result;
 };
 
+/** Random hex string of `byteLength` bytes, for offer and subscription identifiers. */
+export const randomHex = (byteLength: number): string =>
+    bytesToHex(crypto.getRandomValues(new Uint8Array(byteLength)));
+
 export const hexToBytes = (hex: string): Uint8Array => {
     if (!/^[0-9a-f]*$/i.test(hex) || hex.length % 2 !== 0) throw new Error("Invalid hex");
     const result = new Uint8Array(hex.length / 2);
