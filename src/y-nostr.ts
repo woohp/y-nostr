@@ -91,13 +91,13 @@ export interface NostrProviderOptions {
     password?: string;
     awareness?: Awareness;
     maxConns?: number;
-    offerTimeout?: number;
-    signalTimeout?: number;
+    iceGatheringTimeout?: number;
+    handshakeTimeout?: number;
     relayConnectTimeout?: number;
     fallbackMaxMessageSize?: number;
     maxBufferedAmount?: number;
     rtcConfig?: RTCConfiguration | undefined;
-    channelName?: string;
+    channelLabel?: string;
     privateKey?: Uint8Array;
     WebSocket?: typeof WebSocket;
     RTCPeerConnection?: typeof RTCPeerConnection;
@@ -125,13 +125,13 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
     private readonly relays: readonly string[];
     private readonly password: string;
     private readonly maxConns: number;
-    private readonly offerTimeout: number;
-    private readonly signalTimeout: number;
+    private readonly iceGatheringTimeout: number;
+    private readonly handshakeTimeout: number;
     private readonly relayConnectTimeout: number;
     private readonly fallbackMaxMessageSize: number;
     private readonly maxBufferedAmount: number;
     private readonly rtcConfig: RTCConfiguration;
-    private readonly channelName: string;
+    private readonly channelLabel: string;
     private readonly identity: NostrIdentity;
     readonly peerId: PeerId;
     private readonly debug: boolean;
@@ -166,13 +166,13 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         this.relays = opts.relays ?? selectDefaultRelayUrls(roomName, opts.relayRedundancy);
         this.password = opts.password ?? "";
         this.maxConns = opts.maxConns ?? 20;
-        this.offerTimeout = opts.offerTimeout ?? 5000;
-        this.signalTimeout = opts.signalTimeout ?? 15000;
+        this.iceGatheringTimeout = opts.iceGatheringTimeout ?? 5000;
+        this.handshakeTimeout = opts.handshakeTimeout ?? 15000;
         this.relayConnectTimeout = opts.relayConnectTimeout ?? 10000;
         this.fallbackMaxMessageSize = opts.fallbackMaxMessageSize ?? 256 * 1024;
         this.maxBufferedAmount = opts.maxBufferedAmount ?? 4 * 1024 * 1024;
         this.rtcConfig = opts.rtcConfig ?? defaultRtcConfig;
-        this.channelName = opts.channelName ?? "y-nostr";
+        this.channelLabel = opts.channelLabel ?? "y-nostr";
         this.identity = createIdentity(opts.privateKey);
         this.peerId = this.identity.publicKey;
         this.debug = !!opts.debug;
@@ -524,8 +524,8 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         const peer = new WebrtcDataPeer({
             initiator,
             rtcConfig: this.rtcConfig,
-            channelLabel: this.channelName,
-            iceGatheringTimeout: this.offerTimeout,
+            channelLabel: this.channelLabel,
+            iceGatheringTimeout: this.iceGatheringTimeout,
             fallbackMaxMessageSize: this.fallbackMaxMessageSize,
             maxBufferedAmount: this.maxBufferedAmount,
             ...(this._RTCPeerConnection ? { RTCPeerConnection: this._RTCPeerConnection } : {}),
@@ -781,7 +781,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         pending.timer = setTimeout(() => {
             if (this.pendingPeers.get(peerId) !== pending) return;
             pending.peer.destroy();
-        }, this.signalTimeout);
+        }, this.handshakeTimeout);
     }
 
     private async createPayloadEvent(

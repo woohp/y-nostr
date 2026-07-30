@@ -873,7 +873,7 @@ test("disconnect cancels active ICE negotiation without peer errors or recovery"
         const provider = new NostrProvider(`cancel-ice-${index}`, new Y.Doc(), {
             privateKey: privateKey(38 + index),
             relays: [],
-            offerTimeout: 1000,
+            iceGatheringTimeout: 1000,
             RTCPeerConnection: GatheringPeerConnection,
         });
         context.after(() => provider.destroy());

@@ -55,6 +55,8 @@ Signaling protocol v2 encodes fields as UTF-8 strings prefixed by unsigned 32-bi
 
 Call `provider.destroy()` when you're done. `disconnect()` followed by `connect()` is supported. Pass `rtcConfig` if you need your own STUN/TURN servers, or `relayConnectTimeout` to change the 10-second relay opening timeout.
 
+The remaining timeouts are `iceGatheringTimeout` (5 seconds to gather ICE candidates before sending a non-trickle offer or answer) and `handshakeTimeout` (15 seconds for a peer to finish connecting after its offer or answer is published, after which the attempt is abandoned and recovery is scheduled). `channelLabel` sets the data-channel label, `y-nostr` by default.
+
 WebRTC messages are sent as single data-channel frames. The provider uses the negotiated SCTP `maxMessageSize`, falling back to 256 KiB when unavailable, and rejects sends that would raise `bufferedAmount` above 4 MiB. Override these safeguards with `fallbackMaxMessageSize` and `maxBufferedAmount`. Fragmentation, large-document synchronization beyond the single-frame limit, sustained burst traffic, and outbound queueing are intentionally unsupported.
 
 ```sh
