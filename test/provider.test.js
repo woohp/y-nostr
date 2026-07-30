@@ -83,6 +83,13 @@ const privateKey = (value) => {
     return key;
 };
 
+// These providers have no relays, so walk the scheduler down the path a real relay takes:
+// report one open, then start the request that queued while nothing could carry it.
+const armRetry = (provider) => {
+    provider.announcements.relayOpened({ url: "wss://relay.test" });
+    provider.announcements.startQueuedRequest();
+};
+
 function createProvider(keyValue) {
     return new NostrProvider("test-room", new Y.Doc(), {
         privateKey: privateKey(keyValue),
@@ -400,17 +407,17 @@ test("announcement recovery is bounded, non-overlapping, and cancellable", async
         announcements++;
     };
 
-    provider.scheduleAnnouncementRetry();
-    provider.scheduleAnnouncementRetry();
+    armRetry(provider);
+    armRetry(provider);
     for (const delay of [375, 750, 1500]) {
         context.mock.timers.tick(delay);
         await Promise.resolve();
         await Promise.resolve();
     }
     assert.equal(announcements, 3);
-    assert.equal(provider.announcementRetry.attempt, 3);
+    assert.equal(provider.announcements.attempt, 3);
 
-    provider.scheduleAnnouncementRetry();
+    armRetry(provider);
     await provider.receiveAnnounce("f".repeat(64), {
         url: "wss://relay.test",
         isOpen: () => true,
@@ -418,7 +425,7 @@ test("announcement recovery is bounded, non-overlapping, and cancellable", async
     });
     context.mock.timers.tick(375);
     assert.equal(announcements, 3);
-    assert.equal(provider.announcementRetry, null);
+    assert.equal(provider.announcements.state, "idle");
 });
 test("recovery resumes when a pending peer disappears during offer creation", async (context) => {
     const provider = createProvider(21);
@@ -434,7 +441,7 @@ test("recovery resumes when a pending peer disappears during offer creation", as
         createOffer: () => offer,
         destroy: () => {},
     });
-    provider.scheduleAnnouncementRetry();
+    armRetry(provider);
 
     const peerId = "f".repeat(64);
     const receiving = provider.receiveAnnounce(peerId, {
@@ -443,13 +450,12 @@ test("recovery resumes when a pending peer disappears during offer creation", as
         publish: () => true,
     });
     await Promise.resolve();
-    assert.equal(provider.announcementRetry.paused, true);
+    assert.equal(provider.announcements.state, "paused");
     provider.pendingPeers.delete(peerId);
     resolveOffer({ type: "offer", sdp: "late offer" });
     await receiving;
 
-    assert.equal(provider.announcementRetry.paused, false);
-    assert.ok(provider.announcementRetry.timer);
+    assert.equal(provider.announcements.state, "armed");
 });
 test("retries a dropped initial announcement after the first relay opens", async (context) => {
     const { WebSocket, sockets } = createWebSocketHarness();
@@ -545,7 +551,7 @@ test("repeated offer failures preserve the global retry budget", async (context)
     });
     const relay = { url: "wss://relay.test", isOpen: () => true, publish: () => true };
 
-    provider.scheduleAnnouncementRetry();
+    armRetry(provider);
     for (const delay of [375, 750, 1500]) {
         context.mock.timers.tick(delay);
         await Promise.resolve();
@@ -555,7 +561,7 @@ test("repeated offer failures preserve the global retry budget", async (context)
     context.mock.timers.tick(10000);
 
     assert.equal(announcements, 3);
-    assert.equal(provider.announcementRetry.attempt, 3);
+    assert.equal(provider.announcements.attempt, 3);
 });
 test("protocol send failure starts bounded peer-loss recovery", async (context) => {
     const provider = createProvider(24);
@@ -574,7 +580,7 @@ test("protocol send failure starts bounded peer-loss recovery", async (context) 
         destroy: () => {},
     };
     provider.relayConnections = [relay];
-    provider.openRelays.add(relay);
+    provider.announcements.relayOpened(relay);
     const peer = {
         connected: true,
         send: () => false,
@@ -591,7 +597,7 @@ test("protocol send failure starts bounded peer-loss recovery", async (context) 
     while (announcements < 2) await new Promise((resolve) => setImmediate(resolve));
 
     assert.equal(announcements, 2);
-    assert.equal(provider.announcementRetry.attempt, 2);
+    assert.equal(provider.announcements.attempt, 2);
 });
 test("failed pending connection starts recovery before signal timeout", async (context) => {
     const provider = createProvider(25);
@@ -606,7 +612,7 @@ test("failed pending connection starts recovery before signal timeout", async (c
         destroy: () => {},
     };
     provider.relayConnections = [relay];
-    provider.openRelays.add(relay);
+    provider.announcements.relayOpened(relay);
     const peerId = "pending-peer";
     const peer = {
         acceptAnswer: async () => {
@@ -625,7 +631,7 @@ test("failed pending connection starts recovery before signal timeout", async (c
     await provider.receiveAnswer(peerId, "offer-id", { type: "answer", sdp: "failed" });
 
     assert.equal(provider.pendingPeers.has(peerId), false);
-    assert.ok(provider.announcementRetry?.timer);
+    assert.equal(provider.announcements.state, "armed");
 });
 
 test("owned awareness removal is sent before provider teardown", async (context) => {
@@ -779,7 +785,7 @@ test("transient initial publication failure starts bounded recovery", async (con
     const socket = sockets[0];
 
     socket.open();
-    while (!provider.announcementRetry?.timer) {
+    while (provider.announcements.state !== "armed") {
         await new Promise((resolve) => setImmediate(resolve));
     }
     context.mock.timers.tick(375);
@@ -882,7 +888,7 @@ test("disconnect cancels active ICE negotiation without peer errors or recovery"
 
         assert.deepEqual(errors, []);
         assert.equal(provider.pendingPeers.size, 0);
-        assert.equal(provider.recoveryStartPending, false);
+        assert.equal(provider.announcements.state, "idle");
     }
 });
 test("late Sync Step 2 from a removed peer cannot restore synced", async (context) => {

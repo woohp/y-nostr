@@ -20,6 +20,7 @@ import {
     type NostrEvent,
 } from "./nostr-event.js";
 import { NostrRelay, defaultRelayUrls, selectDefaultRelayUrls } from "./nostr-relay.js";
+import { AnnouncementScheduler } from "./announcement-scheduler.js";
 import { WebrtcDataPeer } from "webrtc-data-peer";
 
 export { defaultRelayUrls };
@@ -152,14 +153,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
     private readonly seenEvents = new Set<string>();
     private readonly seenEventQueue: string[] = [];
     private readonly syncedPeers = new Set<WebrtcDataPeer>();
-    private readonly openRelays = new Set<NostrRelay>();
-    private recoveryStartPending = false;
-    private announcementRetry: {
-        attempt: number;
-        generation: number;
-        paused: boolean;
-        timer?: ReturnType<typeof setTimeout>;
-    } | null = null;
+    private readonly announcements: AnnouncementScheduler;
     private connectionGeneration = 0;
     private connectionActive = false;
     private connectionPromise: Promise<void> | null = null;
@@ -197,6 +191,12 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         };
         this.doc.on("update", this._docUpdateHandler);
         this.awareness.on("update", this._awarenessUpdateHandler);
+
+        this.announcements = new AnnouncementScheduler({
+            announce: () => this.announce(),
+            generation: () => this.connectionGeneration,
+            isLive: (generation) => this.isActive() && this.isCurrentGeneration(generation),
+        });
 
         this.ready = this.connect();
     }
@@ -292,28 +292,17 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
                                 }
                             })
                             .finally(() => {
-                                if (
-                                    this.isActive() &&
-                                    this.recoveryStartPending &&
-                                    this.openRelays.size > 0 &&
-                                    this.isCurrentGeneration(generation)
-                                ) {
-                                    this.recoveryStartPending = false;
-                                    this.startAnnouncementRecoveryEpisode();
+                                if (this.isActive() && this.isCurrentGeneration(generation)) {
+                                    this.announcements.startQueuedRequest();
                                 }
                             });
                     },
                     onStatus: (status, relay) => {
                         if (!this.isActive() || !this.isCurrentGeneration(generation)) return;
                         if (status === "connected") {
-                            if (this.openRelays.size === 0) this.recoveryStartPending = true;
-                            this.openRelays.add(relay);
+                            this.announcements.relayOpened(relay);
                         } else {
-                            this.openRelays.delete(relay);
-                            if (this.openRelays.size === 0) {
-                                this.pauseAnnouncementRetry();
-                                this.recoveryStartPending = true;
-                            }
+                            this.announcements.relayClosed(relay);
                         }
                         this.emit("status", [{ status, relay: relay.url }]);
                     },
@@ -437,13 +426,13 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         createSignal: (peer: WebrtcDataPeer) => Promise<RTCSessionDescriptionInit>,
     ): Promise<void> {
         const generation = this.connectionGeneration;
-        this.pauseAnnouncementRetry();
+        this.announcements.pause();
         let peer: WebrtcDataPeer;
         try {
             peer = this.createPeer(peerId, role === "offering");
         } catch (error) {
             this.emit("peer-error", [error]);
-            this.ensureAnnouncementRecovery();
+            this.announcements.resume();
             return;
         }
         const pending: PendingPeer = {
@@ -458,7 +447,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         try {
             const signal = await createSignal(peer);
             if (this.pendingPeers.get(peerId) !== pending) {
-                this.ensureAnnouncementRecovery();
+                this.announcements.resume();
                 return;
             }
             const topic = await createPeerTopic(this.roomTopic!, peerId);
@@ -476,14 +465,14 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
             );
             if (!published) {
                 peer.destroy();
-                this.ensureAnnouncementRecovery();
+                this.announcements.resume();
                 return;
             }
             if (this.pendingPeers.get(peerId) !== pending) {
-                this.startAnnouncementRecoveryEpisode();
+                this.announcements.request();
                 return;
             }
-            this.cancelAnnouncementRetry();
+            this.announcements.cancel();
             pending.signalPublished = true;
             this.startSignalTimeout(peerId, pending);
             this.emitDebug({
@@ -502,7 +491,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
             }
             this.emit("peer-error", [error]);
             peer.destroy();
-            this.ensureAnnouncementRecovery();
+            this.announcements.resume();
         }
     }
 
@@ -575,7 +564,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
             this.pendingPeers.delete(peerId);
         }
         this.peers.set(peerId, peer);
-        this.cancelAnnouncementRetry();
+        this.announcements.cancel();
         this.emitDebug({ type: "peer-connect", peerId, initiator });
         if (!this.sendSyncStep1(peer) || !this.sendAwareness(peer)) return;
         this.emit("peers", [this.peerIds]);
@@ -657,7 +646,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
             }
         }
         if (changed) this.emit("peers", [this.peerIds]);
-        if (changed || shouldRecover) this.startAnnouncementRecoveryEpisode();
+        if (changed || shouldRecover) this.announcements.request();
     }
 
     private sendProtocolMessage(peer: WebrtcDataPeer, message: Uint8Array<ArrayBuffer>): boolean {
@@ -721,9 +710,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         this.connectionActive = false;
         this.connectionPromise = null;
         this.connectionGeneration++;
-        this.cancelAnnouncementRetry();
-        this.openRelays.clear();
-        this.recoveryStartPending = false;
+        this.announcements.reset();
         for (const relay of this.relayConnections) relay.destroy();
         this.relayConnections = [];
         for (const peer of this.peers.values()) peer.destroy();
@@ -783,75 +770,6 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         if (synced === this._synced) return;
         this._synced = synced;
         this.emit("synced", [synced]);
-    }
-
-    private startAnnouncementRecoveryEpisode(): void {
-        if (this.openRelays.size === 0) {
-            this.recoveryStartPending = true;
-            return;
-        }
-        this.cancelAnnouncementRetry();
-        this.scheduleAnnouncementRetry();
-    }
-
-    private scheduleAnnouncementRetry(): void {
-        if (!this.isActive() || this.announcementRetry) return;
-        this.announcementRetry = {
-            attempt: 0,
-            generation: this.connectionGeneration,
-            paused: false,
-        };
-        this.scheduleNextAnnouncementRetry(this.announcementRetry);
-    }
-
-    private scheduleNextAnnouncementRetry(
-        state: NonNullable<NostrProvider["announcementRetry"]>,
-    ): void {
-        if (
-            this.announcementRetry !== state ||
-            !this.isActive() ||
-            !this.isCurrentGeneration(state.generation) ||
-            state.paused ||
-            state.timer ||
-            state.attempt >= 3
-        ) {
-            return;
-        }
-        const delay = 500 * 2 ** state.attempt * (0.75 + Math.random() * 0.5);
-        state.timer = setTimeout(() => {
-            delete state.timer;
-            state.attempt++;
-            if (
-                this.announcementRetry !== state ||
-                !this.isActive() ||
-                !this.isCurrentGeneration(state.generation)
-            ) {
-                return;
-            }
-            void this.announce().finally(() => this.scheduleNextAnnouncementRetry(state));
-        }, delay);
-    }
-
-    private pauseAnnouncementRetry(): void {
-        if (!this.announcementRetry) return;
-        this.announcementRetry.paused = true;
-        clearTimeout(this.announcementRetry.timer);
-        delete this.announcementRetry.timer;
-    }
-
-    private ensureAnnouncementRecovery(): void {
-        if (!this.announcementRetry) {
-            this.startAnnouncementRecoveryEpisode();
-            return;
-        }
-        this.announcementRetry.paused = false;
-        this.scheduleNextAnnouncementRetry(this.announcementRetry);
-    }
-
-    private cancelAnnouncementRetry(): void {
-        if (!this.announcementRetry) return;
-        clearTimeout(this.announcementRetry.timer);
-        this.announcementRetry = null;
     }
 
     private hasCapacity(): boolean {
