@@ -6,22 +6,20 @@ import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 import { ObservableV2 } from "lib0/observable";
 import {
-    createEvent,
     createIdentity,
     createPeerTopic,
     decrypt,
     deriveRoomSecrets,
     encrypt,
-    signalExpirationSeconds,
-    type NostrEvent,
     type NostrIdentity,
 } from "./crypto.js";
 import {
-    NostrRelay,
-    defaultRelayUrls,
+    createEvent,
     getEventTopic,
-    selectDefaultRelayUrls,
-} from "./nostr-relay.js";
+    hasValidSignalExpiration,
+    type NostrEvent,
+} from "./nostr-event.js";
+import { NostrRelay, defaultRelayUrls, selectDefaultRelayUrls } from "./nostr-relay.js";
 import { WebrtcDataPeer } from "webrtc-data-peer";
 
 export { defaultRelayUrls };
@@ -934,18 +932,6 @@ const createOfferId = (): string => {
     let result = "";
     for (const byte of bytes) result += byte.toString(16).padStart(2, "0");
     return result;
-};
-
-const hasValidSignalExpiration = (event: NostrEvent): boolean => {
-    const tags = event.tags.filter((tag) => tag[0] === "expiration");
-    if (tags.length !== 1 || tags[0]!.length !== 2) return false;
-    const value = tags[0]![1]!;
-    if (!/^(0|[1-9]\d*)$/.test(value)) return false;
-    const expiration = Number(value);
-    return (
-        Number.isSafeInteger(expiration) &&
-        expiration === event.created_at + signalExpirationSeconds
-    );
 };
 
 const isSignalPayload = (value: unknown): value is SignalPayload => {

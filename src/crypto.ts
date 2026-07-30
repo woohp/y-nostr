@@ -3,20 +3,6 @@ import { schnorr } from "@noble/secp256k1";
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-export const nostrEventKind = 20000;
-export const nostrTopicTag = "x";
-export const signalExpirationSeconds = 120;
-
-export interface NostrEvent {
-    id: string;
-    pubkey: string;
-    created_at: number;
-    kind: number;
-    tags: string[][];
-    content: string;
-    sig: string;
-}
-
 export interface NostrIdentity {
     secretKey: Uint8Array;
     publicKey: string;
@@ -104,59 +90,6 @@ export const createIdentity = (secretKey?: Uint8Array): NostrIdentity => {
     return { secretKey: identity.secretKey, publicKey: bytesToHex(identity.publicKey) };
 };
 
-export const createEvent = async (
-    topic: string,
-    content: string,
-    identity: NostrIdentity,
-    createdAt: number = Math.floor(Date.now() / 1000),
-): Promise<NostrEvent> => {
-    const unsigned = {
-        pubkey: identity.publicKey,
-        created_at: createdAt,
-        kind: nostrEventKind,
-        tags: [
-            [nostrTopicTag, topic],
-            ["expiration", String(createdAt + signalExpirationSeconds)],
-        ],
-        content,
-    };
-    const idBytes = await sha256(serializeEvent(unsigned));
-    return {
-        ...unsigned,
-        id: bytesToHex(idBytes),
-        sig: bytesToHex(await schnorr.signAsync(idBytes, identity.secretKey)),
-    };
-};
-
-export const verifyEvent = async (event: NostrEvent): Promise<boolean> => {
-    try {
-        if (
-            !/^[0-9a-f]{64}$/.test(event.id) ||
-            !/^[0-9a-f]{64}$/.test(event.pubkey) ||
-            !/^[0-9a-f]{128}$/.test(event.sig) ||
-            !Number.isInteger(event.created_at) ||
-            event.kind !== nostrEventKind ||
-            !Array.isArray(event.tags) ||
-            typeof event.content !== "string"
-        ) {
-            return false;
-        }
-        const idBytes = await sha256(
-            serializeEvent({
-                pubkey: event.pubkey,
-                created_at: event.created_at,
-                kind: event.kind,
-                tags: event.tags,
-                content: event.content,
-            }),
-        );
-        if (bytesToHex(idBytes) !== event.id) return false;
-        return await schnorr.verifyAsync(hexToBytes(event.sig), idBytes, hexToBytes(event.pubkey));
-    } catch {
-        return false;
-    }
-};
-
 export const deriveEncryptionKey = async (roomName: string, password = ""): Promise<CryptoKey> =>
     (await deriveRoomSecrets(roomName, password)).encryptionKey;
 
@@ -182,7 +115,7 @@ export const decrypt = async (key: CryptoKey, packed: string): Promise<string> =
     return textDecoder.decode(plaintext);
 };
 
-const sha256 = async (value: string | Uint8Array): Promise<Uint8Array> =>
+export const sha256 = async (value: string | Uint8Array): Promise<Uint8Array> =>
     new Uint8Array(
         await crypto.subtle.digest(
             "SHA-256",
@@ -204,9 +137,6 @@ const encodeFields = (...fields: string[]): Uint8Array => {
     }
     return result;
 };
-
-const serializeEvent = (event: Omit<NostrEvent, "id" | "sig">): string =>
-    JSON.stringify([0, event.pubkey, event.created_at, event.kind, event.tags, event.content]);
 
 const bytesToBase64 = (bytes: Uint8Array): string => {
     let binary = "";

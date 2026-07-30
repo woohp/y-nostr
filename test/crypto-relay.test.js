@@ -10,10 +10,10 @@ const {
     decrypt,
     deriveEncryptionKey,
     encrypt,
+    getEventTopic,
     verifyEvent,
 } = await import("../dist/index.js");
-const { NostrRelay, getEventTopic, selectDefaultRelayUrls } =
-    await import("../dist/nostr-relay.js");
+const { NostrRelay, selectDefaultRelayUrls } = await import("../dist/nostr-relay.js");
 
 const privateKey = (value) => {
     const key = new Uint8Array(32);

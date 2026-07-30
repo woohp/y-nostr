@@ -1,4 +1,11 @@
-import { nostrEventKind, nostrTopicTag, verifyEvent, type NostrEvent } from "./crypto.js";
+import {
+    getEventTopic,
+    isNostrEvent,
+    nostrEventKind,
+    nostrTopicTag,
+    verifyEvent,
+    type NostrEvent,
+} from "./nostr-event.js";
 
 export const defaultRelayUrls = [
     "wss://basspistol.org",
@@ -263,28 +270,6 @@ const createSubscriptionId = (): string => {
     let result = "";
     for (const byte of bytes) result += byte.toString(16).padStart(2, "0");
     return result;
-};
-
-const isNostrEvent = (value: unknown): value is NostrEvent => {
-    if (!value || typeof value !== "object") return false;
-    const event = value as Record<string, unknown>;
-    return (
-        typeof event["id"] === "string" &&
-        typeof event["pubkey"] === "string" &&
-        typeof event["created_at"] === "number" &&
-        typeof event["kind"] === "number" &&
-        Array.isArray(event["tags"]) &&
-        event["tags"].every(
-            (tag) => Array.isArray(tag) && tag.every((value) => typeof value === "string"),
-        ) &&
-        typeof event["content"] === "string" &&
-        typeof event["sig"] === "string"
-    );
-};
-
-export const getEventTopic = (event: NostrEvent): string | null => {
-    const topicTags = event.tags.filter((tag) => tag[0] === nostrTopicTag);
-    return topicTags.length === 1 && topicTags[0]?.length === 2 ? topicTags[0][1]! : null;
 };
 
 const hasSubscribedTopic = (event: NostrEvent, topics: readonly string[]): boolean => {
