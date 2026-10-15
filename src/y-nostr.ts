@@ -520,7 +520,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
                 if (this.isLive(generation)) this.onPeerMessage(peer, remotePeerId, data);
             },
             onClose: (peer) => {
-                if (this.isCurrentGeneration(generation)) this.removePeer(peer, remotePeerId);
+                if (this.isLive(generation)) this.removePeer(peer, remotePeerId);
             },
             onError: (_peer, error) => {
                 if (this.isLive(generation)) this.emit("peer-error", [error]);
@@ -711,12 +711,8 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         return !this.destroyed && this.shouldConnect;
     }
 
-    private isCurrentGeneration(generation: number): boolean {
-        return generation === this.connectionGeneration;
-    }
-
     private isLive(generation: number): boolean {
-        return this.isActive() && this.isCurrentGeneration(generation);
+        return this.isActive() && generation === this.connectionGeneration;
     }
 
     private negotiationRole(peerId: PeerId): NegotiationRole {
