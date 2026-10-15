@@ -1,5 +1,14 @@
 import type { NostrRelay } from "./nostr-relay.js";
 
+const maxAttempts = 3;
+const baseDelay = 500;
+
+interface Episode {
+    attempt: number;
+    paused: boolean;
+    timer?: ReturnType<typeof setTimeout>;
+}
+
 /**
  * Bounded, jittered retry for room announcements.
  *
@@ -9,62 +18,17 @@ import type { NostrRelay } from "./nostr-relay.js";
  * failed, or the announcement published as a relay opened never landed. An episode fires at
  * most `maxAttempts` times with exponential backoff and then goes quiet for good.
  *
- * A retry is only worth arming while a relay is open to carry it, and only while the connection
- * generation that requested it is still live, so this owns the set of open relays and validates
- * every resumption against the generation captured when its episode began.
+ * A retry is only worth arming while a relay is open to carry it, so this owns the set of open
+ * relays. The provider calls `reset` whenever its connection ends.
  */
-export type AnnouncementSchedulerState =
-    /** Nothing scheduled. */
-    | "idle"
-    /** A retry timer is pending. */
-    | "armed"
-    /** An announcement is in flight; the next retry is armed when it settles. */
-    | "announcing"
-    /** A handshake is in flight and owns the room. Retries resume if it fails. */
-    | "paused"
-    /** A retry is wanted, but no relay is open to carry it yet. */
-    | "awaiting-relay"
-    /** The episode used its whole retry budget. Only a new request revives it. */
-    | "exhausted";
-
-export interface AnnouncementSchedulerOptions {
-    /** Publishes an announcement to every connected relay. */
-    announce: () => Promise<unknown>;
-    /** The connection generation a new episode belongs to. */
-    generation: () => number;
-    /** False once `generation` has been superseded, disconnected, or destroyed. */
-    isLive: (generation: number) => boolean;
-    maxAttempts?: number;
-    baseDelay?: number;
-}
-
-interface Episode {
-    attempt: number;
-    generation: number;
-    paused: boolean;
-    timer?: ReturnType<typeof setTimeout>;
-}
-
 export class AnnouncementScheduler {
-    private readonly options: Required<AnnouncementSchedulerOptions>;
+    private readonly announce: () => Promise<unknown>;
     private readonly openRelays = new Set<NostrRelay>();
     private episode: Episode | null = null;
     private queued = false;
 
-    constructor(options: AnnouncementSchedulerOptions) {
-        this.options = { maxAttempts: 3, baseDelay: 500, ...options };
-    }
-
-    get state(): AnnouncementSchedulerState {
-        if (!this.episode) return this.queued ? "awaiting-relay" : "idle";
-        if (this.episode.paused) return "paused";
-        if (this.episode.timer) return "armed";
-        return this.episode.attempt >= this.options.maxAttempts ? "exhausted" : "announcing";
-    }
-
-    /** Attempts already made by the current episode. */
-    get attempt(): number {
-        return this.episode?.attempt ?? 0;
+    constructor(announce: () => Promise<unknown>) {
+        this.announce = announce;
     }
 
     /**
@@ -77,7 +41,8 @@ export class AnnouncementScheduler {
             return;
         }
         this.cancel();
-        this.arm();
+        this.episode = { attempt: 0, paused: false };
+        this.scheduleNext(this.episode);
     }
 
     /** Suspends retries while a handshake owns the room. */
@@ -141,29 +106,20 @@ export class AnnouncementScheduler {
         this.queued = false;
     }
 
-    /** Begins an episode if none is running. Unlike `request`, never resets a live episode. */
-    private arm(): void {
-        if (this.episode || !this.options.isLive(this.options.generation())) return;
-        this.episode = { attempt: 0, generation: this.options.generation(), paused: false };
-        this.scheduleNext(this.episode);
-    }
-
     private scheduleNext(episode: Episode): void {
         if (
             this.episode !== episode ||
-            !this.options.isLive(episode.generation) ||
             episode.paused ||
             episode.timer ||
-            episode.attempt >= this.options.maxAttempts
+            episode.attempt >= maxAttempts
         ) {
             return;
         }
-        const delay = this.options.baseDelay * 2 ** episode.attempt * (0.75 + Math.random() * 0.5);
+        const delay = baseDelay * 2 ** episode.attempt * (0.75 + Math.random() * 0.5);
         episode.timer = setTimeout(() => {
             delete episode.timer;
             episode.attempt++;
-            if (this.episode !== episode || !this.options.isLive(episode.generation)) return;
-            void this.options.announce().finally(() => this.scheduleNext(episode));
+            void this.announce().finally(() => this.scheduleNext(episode));
         }, delay);
     }
 }
