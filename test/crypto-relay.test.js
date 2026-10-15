@@ -2,17 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createWebSocketHarness } from "../test-support/websocket.js";
 
-const {
-    createEvent,
-    createIdentity,
-    createPeerTopic,
-    createRoomTopic,
-    decrypt,
-    deriveEncryptionKey,
-    encrypt,
-    getEventTopic,
-    verifyEvent,
-} = await import("../dist/index.js");
+const { createIdentity, createPeerTopic, decrypt, deriveRoomSecrets, encrypt } =
+    await import("../dist/crypto.js");
+const { createEvent, getEventTopic, verifyEvent } = await import("../dist/nostr-event.js");
 const { NostrRelay, selectDefaultRelayUrls } = await import("../dist/nostr-relay.js");
 
 const privateKey = (value) => {
@@ -46,17 +38,20 @@ test("creates and verifies canonical Nostr events", async () => {
 });
 
 test("derives stable room and peer topics and encrypts signaling", async () => {
-    const roomTopic = await createRoomTopic("room", "password");
-    assert.equal(roomTopic, await createRoomTopic("room", "password"));
-    assert.notEqual(roomTopic, await createRoomTopic("room", "wrong"));
-    assert.notEqual(await createRoomTopic("b:c", "a"), await createRoomTopic("c", "a:b"));
-    assert.equal((await createPeerTopic(roomTopic, "peer")).length, 64);
+    const secrets = await deriveRoomSecrets("room", "password");
+    const wrong = await deriveRoomSecrets("room", "wrong");
+    assert.equal(secrets.roomTopic, (await deriveRoomSecrets("room", "password")).roomTopic);
+    assert.notEqual(secrets.roomTopic, wrong.roomTopic);
+    assert.notEqual(
+        (await deriveRoomSecrets("b:c", "a")).roomTopic,
+        (await deriveRoomSecrets("c", "a:b")).roomTopic,
+    );
+    assert.equal((await createPeerTopic(secrets.roomTopic, "peer")).length, 64);
 
-    const key = await deriveEncryptionKey("room", "password");
-    const encrypted = await encrypt(key, "secret SDP");
+    const encrypted = await encrypt(secrets.encryptionKey, "secret SDP");
     assert.notEqual(encrypted, "secret SDP");
-    assert.equal(await decrypt(key, encrypted), "secret SDP");
-    await assert.rejects(decrypt(await deriveEncryptionKey("room", "wrong"), encrypted));
+    assert.equal(await decrypt(secrets.encryptionKey, encrypted), "secret SDP");
+    await assert.rejects(decrypt(wrong.encryptionKey, encrypted));
 });
 
 test("subscribes, verifies relay events, and closes cleanly", async (context) => {

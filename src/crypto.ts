@@ -27,7 +27,7 @@ export const hexToBytes = (hex: string): Uint8Array => {
     return result;
 };
 
-export const passwordKdfIterations = 210000;
+const passwordKdfIterations = 210000;
 
 export interface RoomSecrets {
     roomTopic: string;
@@ -76,9 +76,6 @@ export const deriveRoomSecrets = async (roomName: string, password = ""): Promis
     return { roomTopic: bytesToHex(topicBytes), encryptionKey };
 };
 
-export const createRoomTopic = async (roomName: string, password = ""): Promise<string> =>
-    (await deriveRoomSecrets(roomName, password)).roomTopic;
-
 export const createPeerTopic = async (roomTopic: string, peerId: string): Promise<string> =>
     bytesToHex(await sha256(encodeFields("y-nostr", "v2", "peer", roomTopic, peerId)));
 
@@ -93,9 +90,6 @@ export const createIdentity = (secretKey?: Uint8Array): NostrIdentity => {
     const identity = schnorr.keygen();
     return { secretKey: identity.secretKey, publicKey: bytesToHex(identity.publicKey) };
 };
-
-export const deriveEncryptionKey = async (roomName: string, password = ""): Promise<CryptoKey> =>
-    (await deriveRoomSecrets(roomName, password)).encryptionKey;
 
 export const encrypt = async (key: CryptoKey, plaintext: string): Promise<string> => {
     const iv = crypto.getRandomValues(new Uint8Array(12));
