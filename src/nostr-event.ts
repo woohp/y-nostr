@@ -109,19 +109,20 @@ export const isNostrEvent = (value: unknown): value is NostrEvent => {
 };
 
 /** Null unless the event carries exactly one topic tag, so routing is never ambiguous. */
-export const getEventTopic = (event: NostrEvent): string | null => {
-    const topicTags = event.tags.filter((tag) => tag[0] === nostrTopicTag);
-    return topicTags.length === 1 && topicTags[0]?.length === 2 ? topicTags[0][1]! : null;
-};
+export const getEventTopic = (event: NostrEvent): string | null =>
+    singleTagValue(event, nostrTopicTag);
 
 export const hasValidSignalExpiration = (event: NostrEvent): boolean => {
-    const tags = event.tags.filter((tag) => tag[0] === "expiration");
-    if (tags.length !== 1 || tags[0]!.length !== 2) return false;
-    const value = tags[0]![1]!;
-    if (!/^(0|[1-9]\d*)$/.test(value)) return false;
+    const value = singleTagValue(event, "expiration");
+    if (value === null || !/^(0|[1-9]\d*)$/.test(value)) return false;
     const expiration = Number(value);
     return (
         Number.isSafeInteger(expiration) &&
         expiration === event.created_at + signalExpirationSeconds
     );
+};
+
+const singleTagValue = (event: NostrEvent, name: string): string | null => {
+    const tags = event.tags.filter((tag) => tag[0] === name);
+    return tags.length === 1 && tags[0]!.length === 2 ? tags[0]![1]! : null;
 };
