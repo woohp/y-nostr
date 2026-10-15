@@ -23,9 +23,8 @@ const tickAttempt = async (context, attempt) => {
     await Promise.resolve();
 };
 
-test("a request waits for an open relay and its settled announcement", async (context) => {
+test("the first open relay queues an episode that starts once its announcement settles", async (context) => {
     const { scheduler, counter } = createScheduler(context);
-    scheduler.request();
     scheduler.relayOpened(relay("wss://a.test"));
     await tickAttempt(context, 0);
     assert.equal(counter.announcements, 0);
@@ -39,6 +38,7 @@ test("an episode spends a bounded retry budget, and a new request restarts it", 
     const { scheduler, counter } = createScheduler(context);
     scheduler.relayOpened(relay("wss://a.test"));
     scheduler.startQueuedRequest();
+    scheduler.request(); // replaces the episode rather than running a second one
     for (const attempt of [0, 1, 2]) await tickAttempt(context, attempt);
     context.mock.timers.tick(60_000);
     assert.equal(counter.announcements, 3);
@@ -76,7 +76,7 @@ test("resume starts a new episode when the pause outlived its episode", async (c
     assert.equal(counter.announcements, 1);
 });
 
-test("losing the last relay pauses retries until a relay reopens", async (context) => {
+test("losing the last relay cancels retries until a relay reopens", async (context) => {
     const { scheduler, counter } = createScheduler(context);
     const first = relay("wss://a.test");
     const second = relay("wss://b.test");
@@ -89,6 +89,7 @@ test("losing the last relay pauses retries until a relay reopens", async (contex
     assert.equal(counter.announcements, 1, "retries survive while any relay is open");
 
     scheduler.relayClosed(second);
+    scheduler.resume(); // a handshake settling during the outage must not announce
     context.mock.timers.tick(60_000);
     assert.equal(counter.announcements, 1);
 
