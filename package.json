@@ -28,16 +28,16 @@
         "test": "npm run build && node --test"
     },
     "dependencies": {
-        "@noble/secp256k1": "^3.1.0",
-        "lib0": "^0.2.117",
+        "@noble/secp256k1": "^3.2.0",
+        "lib0": "^0.2.119",
         "webrtc-data-peer": "git+https://github.com/woohp/webrtc-data-peer.git#ba5a49f",
         "y-protocols": "^1.0.7",
-        "yjs": "^13.6.31"
+        "yjs": "^13.6.33"
     },
     "devDependencies": {
-        "oxfmt": "^0.59.0",
-        "oxlint": "^1.74.0",
+        "oxfmt": "^0.73.0",
+        "oxlint": "^1.88.0",
         "typescript": "^7.0.2",
-        "vite": "^8.1.5"
+        "vite": "^8.3.4"
     }
 }
