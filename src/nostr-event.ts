@@ -20,7 +20,7 @@ export const nostrTopicTag = "x";
  * `subscriptionLookbackSeconds` covers relay-side clock drift on the `since` filter without
  * dredging up signals from a previous session.
  */
-export const signalExpirationSeconds = 120;
+const signalExpirationSeconds = 120;
 export const maxClockSkewSeconds = 120;
 export const staleAnnouncementSeconds = 90;
 export const subscriptionLookbackSeconds = 5;

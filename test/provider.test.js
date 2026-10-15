@@ -74,8 +74,9 @@ class SelectiveWebSocket {
 
 globalThis.RTCPeerConnection = FakePeerConnection;
 
-const { NostrProvider, createEvent, createIdentity, defaultRtcConfig } =
-    await import("../dist/index.js");
+const { NostrProvider, defaultRtcConfig } = await import("../dist/index.js");
+const { createIdentity } = await import("../dist/crypto.js");
+const { createEvent } = await import("../dist/nostr-event.js");
 
 const privateKey = (value) => {
     const key = new Uint8Array(32);

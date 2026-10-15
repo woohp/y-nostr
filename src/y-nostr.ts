@@ -22,11 +22,9 @@ import {
     staleAnnouncementSeconds,
     type NostrEvent,
 } from "./nostr-event.js";
-import { NostrRelay, defaultRelayUrls, selectDefaultRelayUrls } from "./nostr-relay.js";
+import { NostrRelay, selectDefaultRelayUrls } from "./nostr-relay.js";
 import { AnnouncementScheduler } from "./announcement-scheduler.js";
 import { WebrtcDataPeer } from "webrtc-data-peer";
-
-export { defaultRelayUrls };
 
 export const defaultRtcConfig: RTCConfiguration = {
     iceServers: [

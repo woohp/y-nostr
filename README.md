@@ -49,8 +49,6 @@ The relays only see encrypted signaling. Document updates go over WebRTC. Passwo
 
 `sendToPeer(peerId, data)` sends transient binary data to one connected peer. It returns `false` when the peer is missing or disconnected, the frame or buffering limit is exceeded, or the browser rejects the send. Transport failures are also reported through `peer-error`; directed messages are not persisted or retried.
 
-When using the public crypto helpers, prefer `deriveRoomSecrets(roomName, password)` if both the room topic and encryption key are needed. Calling `createRoomTopic()` and `deriveEncryptionKey()` separately performs the password KDF twice.
-
 Signaling protocol v2 encodes fields as UTF-8 strings prefixed by unsigned 32-bit big-endian lengths. It applies PBKDF2-SHA-256 to the password with 210,000 iterations and salt `["y-nostr", "v2", "room", roomName]`, then uses HKDF-SHA-256 with that salt and the labels `["y-nostr", "v2", "topic"]` and `["y-nostr", "v2", "aes-gcm"]`. Encrypted signaling includes and verifies the event signer and its single `x` topic.
 
 Call `provider.destroy()` when you're done. `disconnect()` followed by `connect()` is supported. Pass `rtcConfig` if you need your own STUN/TURN servers, or `relayConnectTimeout` to change the 10-second relay opening timeout.
