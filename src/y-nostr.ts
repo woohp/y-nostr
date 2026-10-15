@@ -152,7 +152,6 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
     private readonly _docUpdateHandler: DocUpdateHandler;
     private readonly _awarenessUpdateHandler: AwarenessUpdateHandler;
     private readonly seenEvents = new Set<string>();
-    private readonly seenEventQueue: string[] = [];
     private readonly syncedPeers = new Set<WebrtcDataPeer>();
     private readonly announcements: AnnouncementScheduler;
     private connectionGeneration = 0;
@@ -193,11 +192,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         this.doc.on("update", this._docUpdateHandler);
         this.awareness.on("update", this._awarenessUpdateHandler);
 
-        this.announcements = new AnnouncementScheduler({
-            announce: () => this.announce(),
-            generation: () => this.connectionGeneration,
-            isLive: (generation) => this.isActive() && this.isCurrentGeneration(generation),
-        });
+        this.announcements = new AnnouncementScheduler(() => this.announce());
 
         this.ready = this.connect();
     }
@@ -248,7 +243,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
     private async initializeConnection(generation: number): Promise<void> {
         const { roomTopic, encryptionKey } = await deriveRoomSecrets(this.roomName, this.password);
         const peerTopic = await createPeerTopic(roomTopic, this.peerId);
-        if (!this.isActive() || !this.isCurrentGeneration(generation)) return;
+        if (!this.isLive(generation)) return;
         this.roomTopic = roomTopic;
         this.peerTopic = peerTopic;
         this.encryptionKey = encryptionKey;
@@ -262,25 +257,26 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         );
 
         for (const url of this.relays) {
-            if (!this.isActive() || !this.isCurrentGeneration(generation)) break;
+            if (!this.isLive(generation)) break;
             try {
                 const relay = new NostrRelay(url, {
                     topics: [roomTopic, peerTopic],
                     onEvent: (event, relay) => {
-                        void this.receiveEvent(event, relay, generation).catch((error: unknown) => {
-                            if (this.isActive() && this.isCurrentGeneration(generation)) {
+                        if (!this.isLive(generation)) return;
+                        void this.receiveEvent(event, relay).catch((error: unknown) => {
+                            if (this.isLive(generation)) {
                                 this.emit("connection-error", [{ error, relay: relay.url }]);
                             }
                         });
                     },
                     onOpen: (relay, reconnected) => {
-                        if (!this.isActive() || !this.isCurrentGeneration(generation)) return;
+                        if (!this.isLive(generation)) return;
+                        this.announcements.relayOpened(relay);
+                        this.emit("status", [{ status: "connected", relay: relay.url }]);
                         const publication = reconnected
                             ? this.announce(relay)
                             : initialAnnouncement.then((event) => {
-                                  if (!this.isActive() || !this.isCurrentGeneration(generation)) {
-                                      return false;
-                                  }
+                                  if (!this.isLive(generation)) return false;
                                   if (
                                       Math.floor(Date.now() / 1000) - event.created_at >
                                       staleAnnouncementSeconds
@@ -296,22 +292,18 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
                                 }
                             })
                             .finally(() => {
-                                if (this.isActive() && this.isCurrentGeneration(generation)) {
+                                if (this.isLive(generation)) {
                                     this.announcements.startQueuedRequest();
                                 }
                             });
                     },
-                    onStatus: (status, relay) => {
-                        if (!this.isActive() || !this.isCurrentGeneration(generation)) return;
-                        if (status === "connected") {
-                            this.announcements.relayOpened(relay);
-                        } else {
-                            this.announcements.relayClosed(relay);
-                        }
-                        this.emit("status", [{ status, relay: relay.url }]);
+                    onClose: (relay) => {
+                        if (!this.isLive(generation)) return;
+                        this.announcements.relayClosed(relay);
+                        this.emit("status", [{ status: "disconnected", relay: relay.url }]);
                     },
                     onError: (error, relay) => {
-                        if (this.isActive() && this.isCurrentGeneration(generation)) {
+                        if (this.isLive(generation)) {
                             this.emit("connection-error", [{ error, relay: relay.url }]);
                         }
                     },
@@ -334,13 +326,10 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         );
     }
 
-    private async receiveEvent(
-        event: NostrEvent,
-        relay: NostrRelay,
-        generation: number = this.connectionGeneration,
-    ): Promise<void> {
-        if (!this.isActive() || !this.isCurrentGeneration(generation)) return;
-        if (event.pubkey === this.peerId || this.hasSeenEvent(event.id)) return;
+    private async receiveEvent(event: NostrEvent, relay: NostrRelay): Promise<void> {
+        if (!this.isActive()) return;
+        const generation = this.connectionGeneration;
+        if (event.pubkey === this.peerId || this.seenEvents.has(event.id)) return;
         if (Math.abs(Math.floor(Date.now() / 1000) - event.created_at) > maxClockSkewSeconds) {
             return;
         }
@@ -357,7 +346,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
             this.emitDebug({ type: "signal-decrypt-failed", relay: relay.url });
             return;
         }
-        if (!this.isActive() || !this.isCurrentGeneration(generation)) return;
+        if (!this.isLive(generation)) return;
         if (!isSignalPayload(payload) || payload.v !== protocolVersion) return;
         if (payload.from !== event.pubkey || payload.topic !== eventTopic) return;
         if (!this.hasValidRouting(payload, eventTopic)) return;
@@ -488,13 +477,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
                 relay: relay.url,
             });
         } catch (error) {
-            if (
-                !this.isActive() ||
-                !this.isCurrentGeneration(generation) ||
-                this.pendingPeers.get(peerId) !== pending
-            ) {
-                return;
-            }
+            if (!this.isLive(generation) || this.pendingPeers.get(peerId) !== pending) return;
             this.emit("peer-error", [error]);
             peer.destroy();
             this.announcements.resume();
@@ -513,13 +496,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         try {
             await pending.peer.acceptAnswer(signal);
         } catch (error) {
-            if (
-                !this.isActive() ||
-                !this.isCurrentGeneration(generation) ||
-                this.pendingPeers.get(peerId) !== pending
-            ) {
-                return;
-            }
+            if (!this.isLive(generation) || this.pendingPeers.get(peerId) !== pending) return;
             this.emit("peer-error", [error]);
             pending.peer.destroy();
         }
@@ -535,13 +512,18 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
             fallbackMaxMessageSize: this.fallbackMaxMessageSize,
             maxBufferedAmount: this.maxBufferedAmount,
             ...(this._RTCPeerConnection ? { RTCPeerConnection: this._RTCPeerConnection } : {}),
-            onOpen: (peer) => this.onPeerOpen(peer, remotePeerId, initiator, generation),
-            onMessage: (peer, data) => this.onPeerMessage(peer, remotePeerId, data, generation),
-            onClose: (peer) => this.removePeer(peer, remotePeerId, generation),
+            onOpen: (peer) => {
+                if (this.isLive(generation)) this.onPeerOpen(peer, remotePeerId, initiator);
+                else peer.destroy();
+            },
+            onMessage: (peer, data) => {
+                if (this.isLive(generation)) this.onPeerMessage(peer, remotePeerId, data);
+            },
+            onClose: (peer) => {
+                if (this.isCurrentGeneration(generation)) this.removePeer(peer, remotePeerId);
+            },
             onError: (_peer, error) => {
-                if (this.isActive() && this.isCurrentGeneration(generation)) {
-                    this.emit("peer-error", [error]);
-                }
+                if (this.isLive(generation)) this.emit("peer-error", [error]);
             },
             onDebug: (event) => this.emitDebug({ type: String(event["type"]), ...event }),
         });
@@ -549,16 +531,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         return peer;
     }
 
-    private onPeerOpen(
-        peer: WebrtcDataPeer,
-        peerId: PeerId,
-        initiator: boolean,
-        generation: number = this.connectionGeneration,
-    ): void {
-        if (!this.isActive() || !this.isCurrentGeneration(generation)) {
-            peer.destroy();
-            return;
-        }
+    private onPeerOpen(peer: WebrtcDataPeer, peerId: PeerId, initiator: boolean): void {
         const existing = this.peers.get(peerId);
         if (existing && existing !== peer) {
             peer.destroy();
@@ -576,13 +549,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         this.emit("peers", [this.peerIds]);
     }
 
-    private onPeerMessage(
-        peer: WebrtcDataPeer,
-        peerId: PeerId,
-        data: ArrayBuffer,
-        generation: number = this.connectionGeneration,
-    ): void {
-        if (!this.isActive() || !this.isCurrentGeneration(generation)) return;
+    private onPeerMessage(peer: WebrtcDataPeer, peerId: PeerId, data: ArrayBuffer): void {
         if (this.peers.get(peerId) !== peer || !peer.connected) return;
         try {
             if (this.readPeerMessage(peer, peerId, data) === "sync-step-2") {
@@ -629,27 +596,20 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         return "handled";
     }
 
-    private removePeer(
-        peer: WebrtcDataPeer,
-        peerId: PeerId,
-        generation: number = this.connectionGeneration,
-    ): void {
-        if (!this.isCurrentGeneration(generation)) return;
+    private removePeer(peer: WebrtcDataPeer, peerId: PeerId): void {
         let changed = false;
         let shouldRecover = false;
         this.syncedPeers.delete(peer);
         this.updateSyncedState();
-        if (peerId && this.peers.get(peerId) === peer) {
+        if (this.peers.get(peerId) === peer) {
             this.peers.delete(peerId);
             changed = true;
         }
-        if (peerId) {
-            const pending = this.pendingPeers.get(peerId);
-            if (pending?.peer === peer) {
-                clearTimeout(pending.timer);
-                this.pendingPeers.delete(peerId);
-                shouldRecover = pending.signalPublished;
-            }
+        const pending = this.pendingPeers.get(peerId);
+        if (pending?.peer === peer) {
+            clearTimeout(pending.timer);
+            this.pendingPeers.delete(peerId);
+            shouldRecover = pending.signalPublished;
         }
         if (changed) this.emit("peers", [this.peerIds]);
         if (changed || shouldRecover) this.announcements.request();
@@ -755,6 +715,10 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         return generation === this.connectionGeneration;
     }
 
+    private isLive(generation: number): boolean {
+        return this.isActive() && this.isCurrentGeneration(generation);
+    }
+
     private negotiationRole(peerId: PeerId): NegotiationRole {
         if (peerId === this.peerId) return "self";
         return this.peerId < peerId ? "offering" : "answering";
@@ -813,7 +777,7 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         const generation = this.connectionGeneration;
         try {
             const event = await this.createPayloadEvent(topic, payload);
-            if (!this.isActive() || !this.isCurrentGeneration(generation)) return false;
+            if (!this.isLive(generation)) return false;
             const hadOpenRelay = relays.some((relay) => relay.isOpen());
             let published = false;
             for (const relay of relays) published = relay.publish(event) || published;
@@ -837,16 +801,11 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
         }
     }
 
-    private hasSeenEvent(id: string): boolean {
-        return this.seenEvents.has(id);
-    }
-
     private rememberEvent(id: string): void {
         this.seenEvents.add(id);
-        this.seenEventQueue.push(id);
-        if (this.seenEventQueue.length > seenEventLimit) {
-            const removed = this.seenEventQueue.shift();
-            if (removed) this.seenEvents.delete(removed);
+        // Sets iterate in insertion order, so the first value is the oldest.
+        if (this.seenEvents.size > seenEventLimit) {
+            this.seenEvents.delete(this.seenEvents.values().next().value!);
         }
     }
 }

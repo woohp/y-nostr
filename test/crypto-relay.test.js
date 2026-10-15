@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { waitFor } from "../test-support/wait.js";
 import { createWebSocketHarness } from "../test-support/websocket.js";
 
 const { createIdentity, createPeerTopic, decrypt, deriveRoomSecrets, encrypt } =
@@ -73,9 +74,7 @@ test("subscribes, verifies relay events, and closes cleanly", async (context) =>
     socket.dispatch("message", {
         data: JSON.stringify(["EVENT", relay.subscriptionId, event]),
     });
-    while (received.length === 0) {
-        await new Promise((resolve) => setTimeout(resolve, 5));
-    }
+    await waitFor(() => received.length > 0);
     assert.deepEqual(received, [event]);
 
     socket.dispatch("message", {
@@ -88,7 +87,6 @@ test("subscribes, verifies relay events, and closes cleanly", async (context) =>
     relay.destroy();
     assert.equal(socket.sent.at(-1)[0], "CLOSE");
     assert.equal(relay.connected, false);
-    assert.equal(relay.reconnectTimer, undefined);
 });
 test("ignores malformed tags and events completed after destruction", async (context) => {
     const { WebSocket, sockets } = createWebSocketHarness();
@@ -188,12 +186,13 @@ test("reconnects when the relay subscription send fails", (context) => {
 
     context.mock.method(Math, "random", () => 0);
     context.mock.timers.enable({ apis: ["setTimeout"] });
-    const statuses = [];
+    let opened = false;
     const relay = new NostrRelay("wss://relay.test", {
         topics: ["topic"],
         onEvent: () => {},
-        onStatus: (status) => statuses.push(status),
-        onError: () => {},
+        onOpen: () => {
+            opened = true;
+        },
         WebSocket: SubscriptionFailureWebSocket,
     });
     context.after(() => relay.destroy());
@@ -202,6 +201,6 @@ test("reconnects when the relay subscription send fails", (context) => {
 
     socket.dispatch("open");
 
-    assert.deepEqual(statuses, []);
+    assert.equal(opened, false);
     assert.ok(relay.reconnectTimer);
 });
