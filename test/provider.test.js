@@ -354,9 +354,15 @@ test("a published offer stops announcement retries", async (context) => {
         announcements++;
     };
 
+    let offers = 0;
+    const relay = fakeRelay(() => {
+        offers++;
+        return true;
+    });
+
     armRetry(provider);
-    await provider.receiveAnnounce("f".repeat(64), fakeRelay());
-    assert.equal(provider.pendingPeers.get("f".repeat(64))?.signalPublished, true);
+    await provider.receiveAnnounce("f".repeat(64), relay);
+    assert.equal(offers, 1);
 
     context.mock.timers.tick(10_000);
     assert.equal(announcements, 0);
@@ -414,6 +420,36 @@ test("retries a dropped initial announcement after the first relay opens", async
     context.mock.timers.tick(375);
     await waitFor(() => eventCount() >= 2);
     assert.equal(eventCount(), 2);
+});
+
+test("reconnecting restores the first-open announcement backstop", async (context) => {
+    const { WebSocket, sockets } = createWebSocketHarness();
+    context.mock.method(Math, "random", () => 0);
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    const provider = new NostrProvider("reconnect-room", new Y.Doc(), {
+        privateKey: privateKey(41),
+        relays: ["wss://relay.test"],
+        WebSocket,
+    });
+    context.after(() => provider.destroy());
+    await provider.ready;
+    const eventCount = (socket) => socket.sent.filter((message) => message[0] === "EVENT").length;
+
+    // Spend the first connection's whole backstop episode so no leftover timer can stand in
+    // for the one the reconnect must queue.
+    sockets[0].open();
+    await waitFor(() => eventCount(sockets[0]) === 1);
+    for (const [index, delay] of [375, 750, 1500].entries()) {
+        context.mock.timers.tick(delay);
+        await waitFor(() => eventCount(sockets[0]) === index + 2);
+    }
+
+    provider.disconnect();
+    await provider.connect();
+    sockets[1].open();
+    await waitFor(() => eventCount(sockets[1]) === 1);
+    context.mock.timers.tick(375);
+    await waitFor(() => eventCount(sockets[1]) === 2);
 });
 
 test("protocol send failures destroy only the failed peer", async (context) => {
@@ -721,7 +757,6 @@ test("transient initial publication failure starts bounded recovery", async (con
 
     socket.open();
     await waitFor(() => socket.eventAttempts >= 1);
-    await new Promise((resolve) => setImmediate(resolve));
     context.mock.timers.tick(375);
     await waitFor(() => socket.eventAttempts >= 2);
 
