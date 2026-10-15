@@ -90,7 +90,7 @@ export class AnnouncementScheduler {
      * retry exists to back up.
      */
     startQueuedRequest(): void {
-        if (!this.queued || this.openRelays.size === 0) return;
+        if (!this.queued) return;
         this.queued = false;
         this.request();
     }
