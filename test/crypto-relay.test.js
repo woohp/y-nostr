@@ -153,7 +153,8 @@ test("retries after a synchronous WebSocket reconnect failure", (context) => {
     context.mock.timers.tick(750);
 
     assert.match(String(errors[0]), /constructor failed/);
-    assert.ok(relay.reconnectTimer);
+    context.mock.timers.tick(1500);
+    assert.equal(ReconnectWebSocket.attempts, 3);
 });
 test("times out a WebSocket that never opens and schedules reconnect", (context) => {
     const { WebSocket } = createWebSocketHarness();
