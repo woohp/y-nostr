@@ -33,13 +33,11 @@ export class AnnouncementScheduler {
 
     /**
      * The room's peer set changed in a way that warrants re-announcing. Restarts the episode
-     * from attempt zero, discarding any budget a previous episode had already spent.
+     * from attempt zero, discarding any budget a previous episode had already spent. With no
+     * relay open there is nothing to do: the next relay to open queues an episode anyway.
      */
     request(): void {
-        if (this.openRelays.size === 0) {
-            this.queued = true;
-            return;
-        }
+        if (this.openRelays.size === 0) return;
         this.cancel();
         this.episode = { attempt: 0, paused: false };
         this.scheduleNext(this.episode);
@@ -83,15 +81,13 @@ export class AnnouncementScheduler {
 
     relayClosed(relay: NostrRelay): void {
         this.openRelays.delete(relay);
-        if (this.openRelays.size > 0) return;
-        this.pause();
-        this.queued = true;
+        if (this.openRelays.size === 0) this.cancel();
     }
 
     /**
-     * Starts a request queued while no relay was open. Call this once the announcement sent on
-     * a freshly opened relay has settled -- arming any earlier would race the very announcement
-     * the retry exists to back up.
+     * Starts the request queued when the first relay opened. Call this once the announcement
+     * sent on that relay has settled -- arming any earlier would race the very announcement the
+     * retry exists to back up.
      */
     startQueuedRequest(): void {
         if (!this.queued || this.openRelays.size === 0) return;
