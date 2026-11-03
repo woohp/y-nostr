@@ -525,7 +525,6 @@ export class NostrProvider extends ObservableV2<NostrProviderEvents> {
             onError: (_peer, error) => {
                 if (this.isLive(generation)) this.emit("peer-error", [error]);
             },
-            onDebug: (event) => this.emitDebug({ type: String(event["type"]), ...event }),
         });
         this.emitDebug({ type: "peer-created", initiator, peerId: remotePeerId });
         return peer;
